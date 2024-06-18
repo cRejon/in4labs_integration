@@ -3,9 +3,41 @@ In4Labs - Systems Integration remote lab
 # Description
 Implementation of the Systems Integration remote lab inside a Docker container that will be run by [In4Labs base LTI tool](https://github.com/cRejon/in4labs).   
 Tested on Raspberry Pi OS Lite Bullseye (64-bit).  
-Requires Python >=3.9.
+Docker version 25.0.5 
+Requires Python >=3.9 
 
 # Installation
+## Arduino USB connections
+Connect each Arduino board to the Raspberry Pi according to boards configuration.
+``` python
+# Boards configuration
+boards = {
+    'Board_1':{
+        'name':'Sensor',
+         ...
+        'usb_port':'1',
+    },
+    'Board_2':{
+        'name':'LCD',
+         ...
+        'usb_port':'2',
+    },
+    'Board_3':{
+        'name':'Fan',
+         ...
+        'usb_port':'3',
+    }
+}
+```
+If you look at the USB hub from the front, the port numbering is as follows.
+
+                _______    _______ 
+               | _____ |  | _____ | 
+        3-->   ||_____||  ||_____||  <-- 1
+               | _____ |  | _____ | 
+        4-->   ||_____||  ||_____||  <-- 2
+               |_______|__|_______|
+
 ## Create a wireless access point
 1. Set WiFi country code
 ``` bash
@@ -72,54 +104,71 @@ sudo systemctl start dnsmasq
 sudo systemctl enable hostapd
 sudo systemctl enable dnsmasq
 ```
-## Arduino USB connections
-Connect each Arduino board to the Raspberry Pi according to boards configuration.
-```
-# Boards configuration
-boards = {
-    'Board_1':{
-        'name':'Sensor',
-         ...
-        'usb_port':'1',
-    },
-    'Board_2':{
-        'name':'TFT',
-         ...
-        'usb_port':'2',
-    },
-    'Board_3':{
-        'name':'Fan',
-         ...
-        'usb_port':'3',
-    }
-}
-```
-If you look at the USB hub from the front, the port numbering is as follows.
-
-                _______    _______ 
-               | _____ |  | _____ | 
-        3-->   ||_____||  ||_____||  <-- 1
-               | _____ |  | _____ | 
-        4-->   ||_____||  ||_____||  <-- 2
-               |_______|__|_______|
 
 # Testing
 ## Setup Raspberry Pi
 ### Docker installation
+1. Run the following command to uninstall all conflicting packages:
 ``` bash
-curl -fsSL https://get.docker.com -o get-docker.sh
-sudo sh get-docker.sh
-sudo apt-get install -y uidmap
-dockerd-rootless-setuptool.sh install
-rm get-docker.sh
+for pkg in docker.io docker-doc docker-compose podman-docker containerd runc; do sudo apt-get remove $pkg; done
 ```
+2. Add Docker's official GPG key:
+``` bash
+sudo apt update
+sudo apt-get install ca-certificates curl uidmap
+sudo install -m 0755 -d /etc/apt/keyrings
+sudo curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc
+sudo chmod a+r /etc/apt/keyrings/docker.asc
+```
+3. Add the repository to Apt sources:
+``` bash
+echo \
+  "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian \
+  $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
+  sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+sudo apt update
+```
+4. Select the version 25.0.5 for Bullseye and install Docker:
+``` bash
+VERSION_STRING=5:25.0.5-1~debian.11~bullseye
+sudo apt-get install docker-ce=$VERSION_STRING docker-ce-cli=$VERSION_STRING containerd.io
+```
+#### Set Rootless mode
+1. Disable the system-wide Docker daemon:
+``` bash
+sudo systemctl disable --now docker.service docker.socket
+sudo rm /var/run/docker.sock
+```
+2. Run dockerd-rootless-setuptool.sh install as a non-root user to set up the daemon:
+``` bash
+dockerd-rootless-setuptool.sh install
+```
+3. To run docker.service on system startup:
+``` bash
+sudo loginctl enable-linger pi
+```
+#### Change the permissions of the folder _/dev/bus/usb_ to be accessible by the current user (_pi_)
+1. Create a new _udev_ rule file:
+``` bash
+sudo nano /etc/udev/rules.d/99-usb.rules
+```
+2. Add the following content to the file:
+``` bash
+SUBSYSTEM=="usb", GROUP="pi", MODE="0775"
+```
+3. Reload and trigger the new _udev_ rules:
+``` bash
+sudo udevadm control --reload-rules
+sudo udevadm trigger
+```
+
 ### Python packages
 ``` bash
 sudo apt install -y python3-docker
 ```
 ## Running
 Execute the **_test.py_** file inside _test folder_ and go in your browser to the given url.  
-The Docker container is created via the Dockerfile <ins>only</ins> the first time this script is run. This will take some time, so please be patient.  
+The Lab Docker container is created via the Dockerfile <ins>only</ins> the first time this script is run. This will take some time, so please be patient.  
 On the login page, enter ```admin@email.com``` as user.
 
 
