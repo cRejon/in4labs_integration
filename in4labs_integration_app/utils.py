@@ -39,9 +39,11 @@ def fill_examples(board):
     key = board[0]
     role = board[1]['role']
 
-    commons_path = os.path.join(current_app.instance_path, 'examples', 'Commons')
-    role_path = os.path.join(current_app.instance_path, 'examples', role)
-    key_path = os.path.join(current_app.instance_path, 'examples', key)
+    app_dir = os.path.abspath('/app')
+    arduino_dir = os.path.join(app_dir, 'arduino')
+    commons_path = os.path.join(arduino_dir, 'examples', 'Commons')
+    role_path = os.path.join(arduino_dir, 'examples', role)
+    key_path = os.path.join(arduino_dir, 'examples', key)
 
     examples = []
     for path in [commons_path, role_path, key_path]:

@@ -51,15 +51,18 @@ boards = {
 
 boards = get_serial_number(boards) # Get the serial number of the boards
 
-app = Flask(__name__, instance_path=os.path.join(os.getcwd(), 'arduino'))
+app = Flask(__name__)
 app.config.from_mapping(flask_config)
+app_dir = os.path.abspath('/app')
+arduino_dir = os.path.join(app_dir, 'arduino')
+nodered_dir = os.path.join(app_dir, 'node-red')
 
 # Create the subfolders for the compilations
 try:
     for board in boards.keys():
-        os.makedirs(os.path.join(app.instance_path, 'compilations', board))
+        os.makedirs(os.path.join(arduino_dir, 'compilations', board))
         for dir in ['build', 'cache', 'temp_sketch']:
-            os.makedirs(os.path.join(app.instance_path, 'compilations', board, dir))
+            os.makedirs(os.path.join(arduino_dir, 'compilations', board, dir))
 except OSError:
     pass
 
@@ -111,7 +114,7 @@ def index():
 @login_required
 def get_example(): 
     example = request.args.get('example')      
-    examples_path = os.path.join(app.instance_path, 'examples')
+    examples_path = os.path.join(arduino_dir, 'examples')
 
     # Find example file in the corresponding folder
     for folder in os.listdir(examples_path):
@@ -127,7 +130,7 @@ def compile():
     board = request.form['board']
     code = request.form['text']
 
-    compilation_path = os.path.join(app.instance_path, 'compilations', board)
+    compilation_path = os.path.join(arduino_dir, 'compilations', board)
     sketch_path = os.path.join(compilation_path, 'temp_sketch')
 
     with open(os.path.join(sketch_path, 'temp_sketch.ino'), 'w') as f:
@@ -157,9 +160,9 @@ def execute():
 def load_sketch(board, target):
     if boards[board]['model'] == 'Arduino Nano ESP32':
         if (target == 'user'): 
-            input_file = os.path.join(app.instance_path, 'compilations', board, 'build', 'temp_sketch.ino.bin')
+            input_file = os.path.join(arduino_dir, 'compilations', board, 'build', 'temp_sketch.ino.bin')
         else: # target == 'stop'
-            input_file = os.path.join(app.instance_path, 'compilations', 'precompiled','stop.ino.bin')
+            input_file = os.path.join(arduino_dir, 'compilations', 'precompiled','stop.ino.bin')
 
         dfu_util = os.path.join('/', 'root', '.arduino15', 'packages', 'arduino',
                                     'tools', 'dfu-util', '0.11.0-arduino5', 'dfu-util')
@@ -171,9 +174,9 @@ def load_sketch(board, target):
         # NOTE: Arduino-cli uses AVRdude to upload the code and it does not work properly if -Pusb flag is used with 
         #       the usb interface of the board, so we use the last two digits of the serial number instead.
         if (target == 'user'): 
-            input_file = os.path.join(app.instance_path, 'compilations', board, 'build', 'temp_sketch.ino.hex')
+            input_file = os.path.join(arduino_dir, 'compilations', board, 'build', 'temp_sketch.ino.hex')
         else: # target == 'stop'
-            input_file = os.path.join(app.instance_path, 'compilations', 'precompiled','stop.ino.hex')
+            input_file = os.path.join(arduino_dir, 'compilations', 'precompiled','stop.ino.hex')
 
         serial_number = boards[board]['serial_number'][-2:]
         avrdude_path = os.path.join('/', 'root', '.arduino15', 'packages', 'arduino',
@@ -256,4 +259,13 @@ def reset():
     # Return the output of the command for debugging purposes
     resp = jsonify(result=result.stdout)
     return resp
+
+@app.route('/get_flows', methods=['GET'])
+@login_required
+def get_flows(): 
+    nodered_data_dir = os.path.join(nodered_dir, 'data')
+    flows_file = os.path.join(nodered_data_dir, 'flows.json')
+    with open(flows_file, 'r') as f:
+        flows = f.read()
+    return jsonify(flows=flows)
 

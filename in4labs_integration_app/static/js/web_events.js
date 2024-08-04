@@ -9,6 +9,28 @@ function onChangeCode(board) {
     $('#button-monitor-'+board).prop('disabled', true);
 }
 
+function getFlows() {
+    $.ajax({
+        type: "GET",
+        url: "get_flows",
+        success: function(response) {
+            document.getElementById('node-red-flows').value = response.flows;
+        },
+        error: ajaxError
+    });
+}
+
+function ajaxError() {
+
+    // Hide loader animation
+    let loader = $('#loader-bg');
+    loader.hide();
+
+    // Back-end error
+    $('#modal_message').modal('show');
+    $('#modal-msg').text(messages.UNEXPECTED_ERROR);
+}
+
 /**
  * Function for the countdown timer. 
 */
@@ -27,6 +49,10 @@ function countdownTimer(end_time) {
             $(".timer").addClass("red"); 
         }
 
+        if (remainingTime <= 5) {
+            getFlows();
+        }
+        
         // Check if the countdown is finished
         if (remainingTime <= 0) {
             clearInterval(countdown);   
@@ -42,8 +68,10 @@ function countdownTimer(end_time) {
             $('#modal_message').modal('show');
             $('#modal-msg').text(messages.SESSION_EXPIRED);
             $('#camera').prepend('<div class="session_blocked"><p>' + messages.SESSION_EXPIRED + '</p></div>');
-            $('#node-red').prop('src', '');
+            $('#node-red').prepend('<div class="session_blocked"><p>' + messages.SESSION_EXPIRED + '</p></div>');
             $('#cam').prop('src', '');
+            $('#node-red-iframe').prop('src', '');
+            $('#node-red-download').show();
         return;
         }
 

@@ -10,6 +10,27 @@ function getEditor(board) {
     } 
 }
 
+function donwloadFlows() {
+    
+    let flows = document.getElementById('node-red-flows').value;
+    let blob = new Blob([flows], {type:'text/plain'});
+    let fileName = 'flows.json';
+
+    let downloadLink = document.createElement("a");
+    downloadLink.download = fileName;
+    downloadLink.innerHTML = 'Download File';
+    
+    if (window.webkitURL != null) {
+        downloadLink.href = window.webkitURL.createObjectURL(blob);
+    } else  {
+        downloadLink.href = window.URL.createObjectURL(blob);
+        downloadLink.style.display = 'none';
+        document.body.appendChild(downloadLink);
+    }
+
+    downloadLink.click();
+}
+
 /**
  * Function that selects one example from a set of local predefined example files and loads in into
  * the editor.
@@ -25,7 +46,8 @@ function onLoadExample(board, example) {
         success: function(response) {
             let editor = getEditor(board);
             editor.setValue(response);
-        }
+        },
+        error: ajaxError
     });
 }
 

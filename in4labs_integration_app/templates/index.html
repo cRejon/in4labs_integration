@@ -37,9 +37,15 @@
                 <div class="col-11">
                     <div class="card" style="background: #00979C; color: white;">
                         <div class="card-body">
-                          <h3><u>Node-RED</u></h3>
+                            <h3 class="card-title"><u>Node-RED</u></h3>
+                            <button id="node-red-download" type="button" class="btn btn-primary" style="display: none;" onclick="donwloadFlows()">Download Flows</button>
                         </div>
-                        <iframe id="node-red" src="{{ node_red_url }}" class="m-2" width="auto" height="600px"></iframe>
+                        <textarea id="node-red-flows" style="display: none;"></textarea>
+                        <iframe id="node-red-iframe"
+                                src="{{ node_red_url }}" 
+                                width="auto" 
+                                height="600px">
+                        </iframe>
                     </div>
                 </div>
             </div>
