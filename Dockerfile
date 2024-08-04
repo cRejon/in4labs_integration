@@ -21,6 +21,7 @@ RUN pip3 install --trusted-host pypi.python.org -r requirements.txt
 # Copy the current directory contents into the container at /app
 COPY in4labs_integration_app /app/in4labs_integration_app
 COPY arduino /app/arduino
+COPY node-red /app/node-red
 
 # Make port 8000 available outside this container
 EXPOSE 8000
