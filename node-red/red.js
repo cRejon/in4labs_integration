@@ -116,6 +116,7 @@ var RED = (function() {
             cache: false,
             url: 'plugins',
             success: function(data) {
+                RED.plugins.setPluginList(data);
                 loader.reportProgress(RED._("event.loadPlugins"), 13)
                 RED.i18n.loadPluginCatalogs(function() {
                     loadPlugins(function() {
@@ -388,6 +389,7 @@ var RED = (function() {
                                 RED.workspaces.show(workspaces[0]);
                             }
                         }
+                        RED.events.emit('flows:loaded')
                     } catch(err) {
                         console.warn(err);
                         RED.notify(
@@ -623,6 +625,41 @@ var RED = (function() {
                 node.dirtyStatus = true;
                 node.dirty = true;
                 RED.view.redrawStatus(node);
+            }
+        });
+        RED.comms.subscribe("notification/plugin/#",function(topic,msg) {
+            if (topic == "notification/plugin/added") {
+                RED.settings.refreshSettings(function(err, data) {
+                    let addedPlugins = [];
+                    msg.forEach(function(m) {
+                        let id = m.id;
+                        RED.plugins.addPlugin(m);
+
+                        m.plugins.forEach((p) => {
+                            addedPlugins.push(p.id);
+                        })
+
+                        RED.i18n.loadNodeCatalog(id, function() {
+                            var lang = localStorage.getItem("editor-language")||RED.i18n.detectLanguage();
+                            $.ajax({
+                                headers: {
+                                    "Accept":"text/html",
+                                    "Accept-Language": lang
+                                },
+                                cache: false,
+                                url: 'plugins/'+id,
+                                success: function(data) {
+                                    appendPluginConfig(data);
+                                }
+                            });
+                        });
+                    });
+                    if (addedPlugins.length) {
+                        let pluginList = "<ul><li>"+addedPlugins.map(RED.utils.sanitize).join("</li><li>")+"</li></ul>";
+                        // ToDo: Adapt notification (node -> plugin)
+                        RED.notify(RED._("palette.event.nodeAdded", {count:addedPlugins.length})+pluginList,"success");
+                    }
+                })
             }
         });
 
@@ -894,6 +931,10 @@ var RED = (function() {
 
         RED.nodes.init();
         RED.runtime.init()
+
+        if (RED.settings.theme("multiplayer.enabled",false)) {
+            RED.multiplayer.init()
+        }
         RED.comms.connect();
 
         $("#red-ui-main-container").show();
@@ -1812,6 +1853,7 @@ RED.user = (function() {
     }
 
     function logout() {
+        RED.events.emit('logout')
         var tokens = RED.settings.get("auth-tokens");
         var token = tokens?tokens.access_token:"";
         $.ajax({
@@ -1836,6 +1878,8 @@ RED.user = (function() {
 
     function updateUserMenu() {
         $("#red-ui-header-button-user-submenu li").remove();
+        const userMenu = $("#red-ui-header-button-user")
+        userMenu.empty()
         if (RED.settings.user.anonymous) {
             RED.menu.addItem("red-ui-header-button-user",{
                 id:"usermenu-item-login",
@@ -1863,7 +1907,8 @@ RED.user = (function() {
                 }
             });
         }
-
+        const userIcon = generateUserIcon(RED.settings.user)
+        userIcon.appendTo(userMenu);
     }
 
     function init() {
@@ -1872,14 +1917,6 @@ RED.user = (function() {
 
                 var userMenu = $('<li><a id="red-ui-header-button-user" class="button hide" href="#"></a></li>')
                     .prependTo(".red-ui-header-toolbar");
-                if (RED.settings.user.image) {
-                    $('<span class="user-profile"></span>').css({
-                        backgroundImage: "url("+RED.settings.user.image+")",
-                    }).appendTo(userMenu.find("a"));
-                } else {
-                    $('<i class="fa fa-user"></i>').appendTo(userMenu.find("a"));
-                }
-
                 RED.menu.init({id:"red-ui-header-button-user",
                     options: []
                 });
@@ -1942,12 +1979,30 @@ RED.user = (function() {
         return false;
     }
 
+    function generateUserIcon(user) {
+        const userIcon = $('<span class="red-ui-user-profile"></span>')
+        if (user.image) {
+            userIcon.addClass('has_profile_image')
+            userIcon.css({
+                backgroundImage: "url("+user.image+")",
+            })
+        } else if (user.anonymous) {
+            $('<i class="fa fa-user"></i>').appendTo(userIcon);
+        } else {
+            $('<span>').text(user.username.substring(0,2)).appendTo(userIcon);
+        }
+        if (user.profileColor !== undefined) {
+            userIcon.addClass('red-ui-user-profile-color-' + user.profileColor)
+        }
+        return userIcon
+    }
 
     return {
         init: init,
         login: login,
         logout: logout,
-        hasPermission: hasPermission
+        hasPermission: hasPermission,
+        generateUserIcon
     }
 
 })();
@@ -1979,6 +2034,15 @@ RED.comms = (function() {
     var reconnectAttempts = 0;
     var active = false;
 
+    RED.events.on('login', function(username) {
+        // User has logged in
+        // Need to upgrade the connection to be authenticated
+        if (ws && ws.readyState == 1) {
+            const auth_tokens = RED.settings.get("auth-tokens");
+            ws.send(JSON.stringify({auth:auth_tokens.access_token}))
+        }
+    })
+
     function connectWS() {
         active = true;
         var wspath;
@@ -2009,6 +2073,7 @@ RED.comms = (function() {
                     ws.send(JSON.stringify({subscribe:t}));
                 }
             }
+            emit('connect')
         }
 
         ws = new WebSocket(wspath);
@@ -2133,10 +2198,54 @@ RED.comms = (function() {
         }
     }
 
+    function send(topic, msg) {
+        if (ws && ws.readyState == 1) {
+            ws.send(JSON.stringify({
+                topic,
+                data: msg
+            }))
+        }
+    }
+
+    const eventHandlers = {};
+    function on(evt,func) {
+        eventHandlers[evt] = eventHandlers[evt]||[];
+        eventHandlers[evt].push(func);
+    }
+    function off(evt,func) {
+        const handler = eventHandlers[evt];
+        if (handler) {
+            for (let i=0;i<handler.length;i++) {
+                if (handler[i] === func) {
+                    handler.splice(i,1);
+                    return;
+                }
+            }
+        }
+    }
+    function emit() {
+        const evt = arguments[0]
+        const args = Array.prototype.slice.call(arguments,1);
+        if (eventHandlers[evt]) {
+            let cpyHandlers = [...eventHandlers[evt]];
+            for (let i=0;i<cpyHandlers.length;i++) {
+                try {
+                    cpyHandlers[i].apply(null, args);
+                } catch(err) {
+                    console.warn("RED.comms.emit error: ["+evt+"] "+(err.toString()));
+                    console.warn(err);
+                }
+            }
+        }
+    }
+
     return {
         connect: connectWS,
         subscribe: subscribe,
-        unsubscribe:unsubscribe
+        unsubscribe:unsubscribe,
+        on,
+        off,
+        send
     }
 })();
 ;RED.runtime = (function() {
@@ -2175,6 +2284,496 @@ RED.comms = (function() {
         }
     }
 })()
+;RED.multiplayer = (function () {
+
+    // activeSessionId - used to identify sessions across websocket reconnects
+    let activeSessionId
+
+    let headerWidget
+    // Map of session id to { session:'', user:{}, location:{}}
+    let sessions = {}
+    // Map of username to { user:{}, sessions:[] }
+    let users = {}
+
+    function addUserSession (session) {
+        if (sessions[session.session]) {
+            // This is an existing connection that has been authenticated
+            const existingSession = sessions[session.session]
+            if (existingSession.user.username !== session.user.username) {
+                removeUserHeaderButton(users[existingSession.user.username])
+            }
+        }
+        sessions[session.session] = session
+        const user = users[session.user.username] = users[session.user.username] || {
+            user: session.user,
+            sessions: []
+        }
+        if (session.user.profileColor === undefined) {
+            session.user.profileColor = (1 + Math.floor(Math.random() * 5))
+        }
+        session.location = session.location || {}
+        user.sessions.push(session)
+
+        if (session.session === activeSessionId) {
+            // This is the current user session - do not add a extra button for them
+        } else {
+            if (user.sessions.length === 1) {
+                if (user.button) {
+                    clearTimeout(user.inactiveTimeout)
+                    clearTimeout(user.removeTimeout)
+                    user.button.removeClass('inactive')
+                } else {
+                    addUserHeaderButton(user)
+                }
+            }
+            sessions[session.session].location = session.location
+            updateUserLocation(session.session)
+        }
+    }
+
+    function removeUserSession (sessionId, isDisconnected) {
+        removeUserLocation(sessionId)
+        const session = sessions[sessionId]
+        delete sessions[sessionId]
+        const user = users[session.user.username]
+        const i = user.sessions.indexOf(session)
+        user.sessions.splice(i, 1)
+        if (isDisconnected) {
+            removeUserHeaderButton(user)
+        } else {
+            if (user.sessions.length === 0) {
+                // Give the user 5s to reconnect before marking inactive
+                user.inactiveTimeout = setTimeout(() => {
+                    user.button.addClass('inactive')
+                    // Give the user further 20 seconds to reconnect before removing them
+                    // from the user toolbar entirely
+                    user.removeTimeout = setTimeout(() => {
+                        removeUserHeaderButton(user)
+                    }, 20000)
+                }, 5000)
+            }
+        }
+    }
+
+    function addUserHeaderButton (user) {
+        user.button = $('<li class="red-ui-multiplayer-user"><button type="button" class="red-ui-multiplayer-user-icon"></button></li>')
+            .attr('data-username', user.user.username)
+            .prependTo("#red-ui-multiplayer-user-list");
+        var button = user.button.find("button")
+        RED.popover.tooltip(button, user.user.username)
+        button.on('click', function () {
+            const location = user.sessions[0].location
+            revealUser(location)
+        })
+
+        const userProfile = RED.user.generateUserIcon(user.user)
+        userProfile.appendTo(button)
+    }
+
+    function removeUserHeaderButton (user) {
+        user.button.remove()
+        delete user.button
+    }
+
+    function getLocation () {
+        const location = {
+            workspace: RED.workspaces.active()
+        }
+        const editStack = RED.editor.getEditStack()
+        for (let i = editStack.length - 1; i >= 0; i--) {
+            if (editStack[i].id) {
+                location.node = editStack[i].id
+                break
+            }
+        }
+        return location
+    }
+    function publishLocation () {
+        const location = getLocation()
+        if (location.workspace !== 0) {
+            log('send', 'multiplayer/location', location)
+            RED.comms.send('multiplayer/location', location)
+        }
+    }
+
+    function revealUser(location, skipWorkspace) {
+        if (location.node) {
+            // Need to check if this is a known node, so we can fall back to revealing
+            // the workspace instead
+            const node = RED.nodes.node(location.node)
+            if (node) {
+                RED.view.reveal(location.node)
+            } else if (!skipWorkspace && location.workspace) {
+                RED.view.reveal(location.workspace)
+            }
+        } else if (!skipWorkspace && location.workspace) {
+            RED.view.reveal(location.workspace)
+        }
+    }
+
+    const workspaceTrays = {}
+    function getWorkspaceTray(workspaceId) {
+        // console.log('get tray for',workspaceId)
+        if (!workspaceTrays[workspaceId]) {
+            const tray = $('<div class="red-ui-multiplayer-users-tray"></div>')
+            const users = []
+            const userIcons = {}
+
+            const userCountIcon = $(`<div class="red-ui-multiplayer-user-location"><span class="red-ui-user-profile red-ui-multiplayer-user-count"><span></span></span></div>`)
+            const userCountSpan = userCountIcon.find('span span')
+            userCountIcon.hide()
+            userCountSpan.text('')
+            userCountIcon.appendTo(tray)
+            const userCountTooltip = RED.popover.tooltip(userCountIcon, function () {
+                    const content = $('<div>')
+                    users.forEach(sessionId => {
+                        $('<div>').append($('<a href="#">').text(sessions[sessionId].user.username).on('click', function (evt) {
+                            evt.preventDefault()
+                            revealUser(sessions[sessionId].location, true)
+                            userCountTooltip.close()
+                        })).appendTo(content)
+                    })
+                    return content
+                },
+                null,
+                true
+            )
+
+            const updateUserCount = function () {
+                const maxShown = 2
+                const children = tray.children()
+                children.each(function (index, element) {
+                    const i = users.length - index
+                    if (i > maxShown) {
+                        $(this).hide()
+                    } else if (i >= 0) {
+                        $(this).show()
+                    }
+                })
+                if (users.length < maxShown + 1) { 
+                    userCountIcon.hide()
+                } else {
+                    userCountSpan.text('+'+(users.length - maxShown))
+                    userCountIcon.show()
+                }
+            }
+            workspaceTrays[workspaceId] = {
+                attached: false,
+                tray,
+                users,
+                userIcons,
+                addUser: function (sessionId) {
+                    if (users.indexOf(sessionId) === -1) {
+                        // console.log(`addUser ws:${workspaceId} session:${sessionId}`)
+                        users.push(sessionId)
+                        const userLocationId = `red-ui-multiplayer-user-location-${sessionId}`
+                        const userLocationIcon = $(`<div class="red-ui-multiplayer-user-location" id="${userLocationId}"></div>`)
+                        RED.user.generateUserIcon(sessions[sessionId].user).appendTo(userLocationIcon)
+                        userLocationIcon.prependTo(tray)
+                        RED.popover.tooltip(userLocationIcon, sessions[sessionId].user.username)
+                        userIcons[sessionId] = userLocationIcon
+                        updateUserCount()
+                    }
+                },
+                removeUser: function (sessionId) {
+                    // console.log(`removeUser ws:${workspaceId} session:${sessionId}`)
+                    const userLocationId = `red-ui-multiplayer-user-location-${sessionId}`
+                    const index = users.indexOf(sessionId)
+                    if (index > -1) {
+                        users.splice(index, 1)
+                        userIcons[sessionId].remove()
+                        delete userIcons[sessionId]
+                    }
+                    updateUserCount()
+                },
+                updateUserCount
+            }
+        }
+        const trayDef = workspaceTrays[workspaceId]
+        if (!trayDef.attached) {
+            const workspaceTab = $(`#red-ui-tab-${workspaceId}`)
+            if (workspaceTab.length > 0) {
+                trayDef.attached = true
+                trayDef.tray.appendTo(workspaceTab)
+                trayDef.users.forEach(sessionId => {
+                    trayDef.userIcons[sessionId].on('click', function (evt) {
+                        revealUser(sessions[sessionId].location, true)
+                    })
+                })
+            }
+        }
+        return workspaceTrays[workspaceId]
+    }
+    function attachWorkspaceTrays () {
+        let viewTouched = false
+        for (let sessionId of Object.keys(sessions)) {
+            const location = sessions[sessionId].location
+            if (location) {
+                if (location.workspace) {
+                    getWorkspaceTray(location.workspace).updateUserCount()
+                }
+                if (location.node) {
+                    addUserToNode(sessionId, location.node)
+                    viewTouched = true
+                }
+            }
+        }
+        if (viewTouched) {
+            RED.view.redraw()
+        }
+    }
+
+    function addUserToNode(sessionId, nodeId) {
+        const node = RED.nodes.node(nodeId)
+        if (node) {
+            if (!node._multiplayer) {
+                node._multiplayer = {
+                    users: [sessionId]
+                }
+                node._multiplayer_refresh = true
+            } else {
+                if (node._multiplayer.users.indexOf(sessionId) === -1) {
+                    node._multiplayer.users.push(sessionId)
+                    node._multiplayer_refresh = true
+                }
+            }
+        }
+    }
+    function removeUserFromNode(sessionId, nodeId) {
+        const node = RED.nodes.node(nodeId)
+        if (node && node._multiplayer) {
+            const i = node._multiplayer.users.indexOf(sessionId)
+            if (i > -1) {
+                node._multiplayer.users.splice(i, 1)
+            }
+            if (node._multiplayer.users.length === 0) {
+                delete node._multiplayer
+            } else {
+                node._multiplayer_refresh = true
+            }
+        }
+
+    }
+
+    function removeUserLocation (sessionId) {
+        updateUserLocation(sessionId, {})
+    }
+    function updateUserLocation (sessionId, location) {
+        let viewTouched = false
+        const oldLocation = sessions[sessionId].location
+        if (location) {
+            if (oldLocation.workspace !== location.workspace) {
+                // console.log('removing', sessionId, oldLocation.workspace)
+                workspaceTrays[oldLocation.workspace]?.removeUser(sessionId)
+            }
+            if (oldLocation.node !== location.node) {
+                removeUserFromNode(sessionId, oldLocation.node)
+                viewTouched = true
+            }
+            sessions[sessionId].location = location
+        } else {
+            location = sessions[sessionId].location
+        }
+        // console.log(`updateUserLocation sessionId:${sessionId} oldWS:${oldLocation?.workspace} newWS:${location.workspace}`)
+        if (location.workspace) {
+            getWorkspaceTray(location.workspace).addUser(sessionId)
+        }
+        if (location.node) {
+            addUserToNode(sessionId, location.node)
+            viewTouched = true
+        }
+        if (viewTouched) {
+            RED.view.redraw()
+        }
+    }
+
+    // function refreshUserLocations () {
+    //     for (const session of Object.keys(sessions)) {
+    //         if (session !== activeSessionId) {
+    //             updateUserLocation(session)
+    //         }
+    //     }
+    // }
+
+    return {
+        init: function () {
+
+            function createAnnotationUser(user) {
+
+                const group = document.createElementNS("http://www.w3.org/2000/svg","g");
+                const badge = document.createElementNS("http://www.w3.org/2000/svg","circle");
+                const radius = 20
+                badge.setAttribute("cx",radius/2);
+                badge.setAttribute("cy",radius/2);
+                badge.setAttribute("r",radius/2);
+                badge.setAttribute("class", "red-ui-multiplayer-annotation-background")
+                group.appendChild(badge)
+                if (user && user.profileColor !== undefined) {
+                    badge.setAttribute("class", "red-ui-multiplayer-annotation-background red-ui-user-profile-color-" + user.profileColor)
+                }
+                if (user && user.image) {
+                    const image = document.createElementNS("http://www.w3.org/2000/svg","image");
+                    image.setAttribute("width", radius)
+                    image.setAttribute("height", radius)
+                    image.setAttribute("href", user.image)
+                    image.setAttribute("clip-path", "circle("+Math.floor(radius/2)+")")
+                    group.appendChild(image)
+                } else if (user && user.anonymous) {
+                    const anonIconHead = document.createElementNS("http://www.w3.org/2000/svg","circle");
+                    anonIconHead.setAttribute("cx", radius/2)
+                    anonIconHead.setAttribute("cy", radius/2 - 2)
+                    anonIconHead.setAttribute("r", 2.4)
+                    anonIconHead.setAttribute("class","red-ui-multiplayer-annotation-anon-label");
+                    group.appendChild(anonIconHead)
+                    const anonIconBody = document.createElementNS("http://www.w3.org/2000/svg","path");
+                    anonIconBody.setAttribute("class","red-ui-multiplayer-annotation-anon-label");
+                    // anonIconBody.setAttribute("d",`M ${radius/2 - 4} ${radius/2 + 1} h 8 v4 h -8 z`);
+                    anonIconBody.setAttribute("d",`M ${radius/2} ${radius/2 + 5} h -2.5 c -2 1 -2 -5 0.5 -4.5 c 2 1 2 1 4 0 c 2.5 -0.5  2.5 5.5  0 4.5  z`);
+                    group.appendChild(anonIconBody)
+                } else {
+                    const labelText = user.username ? user.username.substring(0,2) : user
+                    const label = document.createElementNS("http://www.w3.org/2000/svg","text");
+                    if (user.username) {
+                        label.setAttribute("class","red-ui-multiplayer-annotation-label");
+                        label.textContent = user.username.substring(0,2)
+                    } else {
+                        label.setAttribute("class","red-ui-multiplayer-annotation-label red-ui-multiplayer-user-count")
+                        label.textContent = user
+                    }
+                    label.setAttribute("text-anchor", "middle")
+                    label.setAttribute("x",radius/2);
+                    label.setAttribute("y",radius/2 + 3);
+                    group.appendChild(label)
+                }
+                const border = document.createElementNS("http://www.w3.org/2000/svg","circle");
+                border.setAttribute("cx",radius/2);
+                border.setAttribute("cy",radius/2);
+                border.setAttribute("r",radius/2);
+                border.setAttribute("class", "red-ui-multiplayer-annotation-border")
+                group.appendChild(border)
+          
+
+
+                return group
+            }
+            
+            RED.view.annotations.register("red-ui-multiplayer",{
+                type: 'badge',
+                align: 'left',
+                class: "red-ui-multiplayer-annotation",
+                show: "_multiplayer",
+                refresh: "_multiplayer_refresh",
+                element: function(node) {
+                    const containerGroup = document.createElementNS("http://www.w3.org/2000/svg","g");
+                    containerGroup.setAttribute("transform","translate(0,-4)")
+                    if (node._multiplayer) {
+                        let y = 0
+                        for (let i = Math.min(1, node._multiplayer.users.length - 1); i >= 0; i--) {
+                            const user = sessions[node._multiplayer.users[i]].user
+                            const group = createAnnotationUser(user)
+                            group.setAttribute("transform","translate("+y+",0)")
+                            y += 15
+                            containerGroup.appendChild(group)
+                        }
+                        if (node._multiplayer.users.length > 2) {
+                            const group = createAnnotationUser('+'+(node._multiplayer.users.length - 2))
+                            group.setAttribute("transform","translate("+y+",0)")
+                            y += 12
+                            containerGroup.appendChild(group)
+                        }
+
+                    }
+                    return containerGroup;
+                },
+                tooltip: node => { return node._multiplayer.users.map(u => sessions[u].user.username).join('\n') }
+            });
+
+
+            // activeSessionId = RED.settings.getLocal('multiplayer:sessionId')
+            // if (!activeSessionId) {
+                activeSessionId = RED.nodes.id()
+            //     RED.settings.setLocal('multiplayer:sessionId', activeSessionId)
+            //     log('Session ID (new)', activeSessionId)
+            // } else {
+                log('Session ID', activeSessionId)
+            // }
+            
+            headerWidget = $('<li><ul id="red-ui-multiplayer-user-list"></ul></li>').prependTo('.red-ui-header-toolbar')
+
+            RED.comms.on('connect', () => {
+                const location = getLocation()
+                const connectInfo = {
+                    session: activeSessionId
+                }
+                if (location.workspace !== 0) {
+                    connectInfo.location = location
+                }
+                RED.comms.send('multiplayer/connect', connectInfo)
+            })
+            RED.comms.subscribe('multiplayer/#', (topic, msg) => {
+                log('recv', topic, msg)
+                if (topic === 'multiplayer/init') {
+                    // We have just reconnected, runtime has sent state to
+                    // initialise the world
+                    sessions = {}
+                    users = {}
+                    $('#red-ui-multiplayer-user-list').empty()
+
+                    msg.sessions.forEach(session => {
+                        addUserSession(session)
+                    })
+                } else if (topic === 'multiplayer/connection-added') {
+                    addUserSession(msg)
+                } else if (topic === 'multiplayer/connection-removed') {
+                    removeUserSession(msg.session, msg.disconnected)
+                } else if (topic === 'multiplayer/location') {
+                    const session = msg.session
+                    delete msg.session
+                    updateUserLocation(session, msg)
+                }
+            })
+
+            RED.events.on('workspace:change', (event) => {
+                getWorkspaceTray(event.workspace)
+                publishLocation()
+            })
+            RED.events.on('editor:open', () => {
+                publishLocation()
+            })
+            RED.events.on('editor:close', () => {
+                publishLocation()
+            })
+            RED.events.on('editor:change', () => {
+                publishLocation()
+            })
+            RED.events.on('login', () => {
+                publishLocation()
+            })
+            RED.events.on('flows:loaded', () => {
+                attachWorkspaceTrays()
+            })
+            RED.events.on('workspace:close', (event) => {
+                // A subflow tab has been closed. Need to mark its tray as detached
+                if (workspaceTrays[event.workspace]) {
+                    workspaceTrays[event.workspace].attached = false
+                }
+            })
+            RED.events.on('logout', () => {
+                const disconnectInfo = {
+                    session: activeSessionId
+                }
+                RED.comms.send('multiplayer/disconnect', disconnectInfo)
+                RED.settings.removeLocal('multiplayer:sessionId')
+            })
+        }
+    }
+
+    function log() {
+        if (RED.multiplayer.DEBUG) {
+            console.log('[multiplayer]', ...arguments)
+        }
+    }
+})();
 ;/**
  * Copyright JS Foundation and other contributors, http://js.foundation
  *
@@ -3672,6 +4271,7 @@ RED.state = {
 ;RED.plugins = (function() {
     var plugins = {};
     var pluginsByType = {};
+    var moduleList = {};
 
     function registerPlugin(id,definition) {
         plugins[id] = definition;
@@ -3709,10 +4309,44 @@ RED.state = {
     function getPluginsByType(type) {
         return pluginsByType[type] || [];
     }
+
+    function setPluginList(list) {
+        for(let i=0;i<list.length;i++) {
+            let p = list[i];
+            addPlugin(p);
+        }
+    }
+
+    function addPlugin(p) {
+
+        moduleList[p.module] = moduleList[p.module] || {
+            name:p.module,
+            version:p.version,
+            local:p.local,
+            sets:{},
+            plugin: true,
+            id: p.id
+        };
+        if (p.pending_version) {
+            moduleList[p.module].pending_version = p.pending_version;
+        }
+        moduleList[p.module].sets[p.name] = p;
+
+        RED.events.emit("registry:plugin-module-added",p.module);
+    }
+
+    function getModule(module) {
+        return moduleList[module];
+    }
+
     return {
         registerPlugin: registerPlugin,
         getPlugin: getPlugin,
-        getPluginsByType: getPluginsByType
+        getPluginsByType: getPluginsByType,
+
+        setPluginList: setPluginList,
+        addPlugin: addPlugin,
+        getModule: getModule
     }
 })();
 ;/**
@@ -3808,6 +4442,31 @@ RED.nodes = (function() {
             getNodeTypes: function() {
                 return Object.keys(nodeDefinitions);
             },
+            /**
+             * Get an array of node definitions
+             * @param {Object} options - options object
+             * @param {boolean} [options.configOnly] - if true, only return config nodes
+             * @param {function} [options.filter] - a filter function to apply to the list of nodes
+             * @returns array of node definitions
+             */
+            getNodeDefinitions: function(options) {
+                const result = []
+                const configOnly = (options && options.configOnly)
+                const filter = (options && options.filter)
+                const keys = Object.keys(nodeDefinitions)
+                for (const key of keys) {
+                    const def = nodeDefinitions[key]
+                    if(!def) { continue }
+                    if (configOnly && def.category !== "config") {
+                            continue
+                    }
+                    if (filter && !filter(nodeDefinitions[key])) {
+                        continue
+                    }
+                    result.push(nodeDefinitions[key])
+                }
+                return result
+            },
             setNodeList: function(list) {
                 nodeList = [];
                 for(var i=0;i<list.length;i++) {
@@ -3841,6 +4500,8 @@ RED.nodes = (function() {
             },
             removeNodeSet: function(id) {
                 var ns = nodeSets[id];
+                if (!ns) { return {} }
+
                 for (var j=0;j<ns.types.length;j++) {
                     delete typeToId[ns.types[j]];
                 }
@@ -7709,7 +8370,14 @@ RED.history = (function() {
         }
         return RED.nodes.junction(id);
     }
-
+    function ensureUnlocked(id, flowsToLock) {
+        const flow = id && (RED.nodes.workspace(id) || RED.nodes.subflow(id) || null);
+        const isLocked = flow ? flow.locked : false;
+        if (flow && isLocked) {
+            flow.locked = false;
+            flowsToLock.add(flow)
+        }
+    }
     function undoEvent(ev) {
         var i;
         var len;
@@ -7739,18 +8407,46 @@ RED.history = (function() {
                         t: 'replace',
                         config: RED.nodes.createCompleteNodeSet(),
                         changed: {},
-                        rev: RED.nodes.version()
+                        moved: {},
+                        complete: true,
+                        rev: RED.nodes.version(),
+                        dirty: RED.nodes.dirty()
                     };
+                    var selectedTab = RED.workspaces.active();
+                    inverseEv.config.forEach(n => {
+                        const node = RED.nodes.node(n.id)
+                        if (node) {
+                            inverseEv.changed[n.id] = node.changed
+                            inverseEv.moved[n.id] = node.moved
+                        }
+                    })
                     RED.nodes.clear();
                     var imported = RED.nodes.import(ev.config);
+                    // Clear all change flags from the import
+                    RED.nodes.dirty(false);
+
+                    const flowsToLock = new Set()
+                    
                     imported.nodes.forEach(function(n) {
                         if (ev.changed[n.id]) {
+                            ensureUnlocked(n.z, flowsToLock)
                             n.changed = true;
-                            inverseEv.changed[n.id] = true;
                         }
+                        if (ev.moved[n.id]) {
+                            ensureUnlocked(n.z, flowsToLock)
+                            n.moved = true;
+                        }
+                    })
+                    flowsToLock.forEach(flow => {
+                        flow.locked = true
                     })
 
                     RED.nodes.version(ev.rev);
+                    RED.view.redraw(true);
+                    RED.palette.refresh();
+                    RED.workspaces.refresh();
+                    RED.workspaces.show(selectedTab, true);
+                    RED.sidebar.config.refresh();
                 } else {
                     var importMap = {};
                     ev.config.forEach(function(n) {
@@ -9014,6 +9710,16 @@ RED.utils = (function() {
                 $('<span class="red-ui-debug-msg-type-string-swatch"></span>').css('backgroundColor',obj).appendTo(e);
             }
 
+            let n = RED.nodes.node(obj) ?? RED.nodes.workspace(obj);
+            if (n) {
+                if (options.nodeSelector && "function" == typeof options.nodeSelector) {
+                    e.css('cursor', 'pointer').on("click", function(evt) {
+                        evt.preventDefault();
+                        options.nodeSelector(n.id);
+                    })
+                }
+            }
+
         } else if (typeof obj === 'number') {
             e = $('<span class="red-ui-debug-msg-type-number"></span>').appendTo(entryObj);
 
@@ -9120,6 +9826,7 @@ RED.utils = (function() {
                                     exposeApi: exposeApi,
                                     // tools: tools // Do not pass tools down as we
                                                     // keep them attached to the top-level header
+                                    nodeSelector: options.nodeSelector,
                                 }
                             ).appendTo(row);
                         }
@@ -9150,6 +9857,7 @@ RED.utils = (function() {
                                                 exposeApi: exposeApi,
                                                 // tools: tools // Do not pass tools down as we
                                                                 // keep them attached to the top-level header
+                                                nodeSelector: options.nodeSelector,
                                             }
                                         ).appendTo(row);
                                     }
@@ -9206,6 +9914,7 @@ RED.utils = (function() {
                                 exposeApi: exposeApi,
                                 // tools: tools // Do not pass tools down as we
                                                 // keep them attached to the top-level header
+                                nodeSelector: options.nodeSelector,
                             }
                         ).appendTo(row);
                     }
@@ -9419,11 +10128,25 @@ RED.utils = (function() {
         return parts;
     }
 
-    function validatePropertyExpression(str) {
+    /**
+     * Validate a property expression
+     * @param {*} str - the property value
+     * @returns {boolean|string} whether the node proprty is valid. `true`: valid `false|String`: invalid
+     */
+    function validatePropertyExpression(str, opt) {
         try {
-            var parts = normalisePropertyExpression(str);
+            const parts = normalisePropertyExpression(str);
             return true;
         } catch(err) {
+            // If the validator has opt, it is a 3.x validator that
+            // can return a String to mean 'invalid' and provide a reason
+            if (opt) {
+                if (opt.label) {
+                    return opt.label + ': ' + err.message;
+                }
+                return err.message;
+            }
+            // Otherwise, a 2.x returns a false value
             return false;
         }
     }
@@ -9441,22 +10164,24 @@ RED.utils = (function() {
             // Allow ${ENV_VAR} value
             return true
         }
-        let error
+        let error;
         if (propertyType === 'json') {
             try {
                 JSON.parse(propertyValue);
             } catch(err) {
                 error = RED._("validator.errors.invalid-json", {
                     error: err.message
-                })
+                });
             }
         } else if (propertyType === 'msg' || propertyType === 'flow' || propertyType === 'global' ) {
-            if (!RED.utils.validatePropertyExpression(propertyValue)) {
-                error = RED._("validator.errors.invalid-prop")
+            // To avoid double label
+            const valid = RED.utils.validatePropertyExpression(propertyValue, opt ? {} : null);
+            if (valid !== true) {
+                error = opt ? valid : RED._("validator.errors.invalid-prop");
             }
         } else if (propertyType === 'num') {
             if (!/^NaN$|^[+-]?[0-9]*\.?[0-9]*([eE][-+]?[0-9]+)?$|^[+-]?(0b|0B)[01]+$|^[+-]?(0o|0O)[0-7]+$|^[+-]?(0x|0X)[0-9a-fA-F]+$/.test(propertyValue)) {
-                error = RED._("validator.errors.invalid-num")
+                error = RED._("validator.errors.invalid-num");
             }
         } else if (propertyType === 'jsonata') {
             try { 
@@ -9464,16 +10189,16 @@ RED.utils = (function() {
             } catch(err) {
                 error = RED._("validator.errors.invalid-expr", {
                     error: err.message
-                })
+                });
             }
         }
         if (error) {
             if (opt && opt.label) {
-                return opt.label+': '+error
+                return opt.label + ': ' + error;
             }
-            return error
+            return error;
         }
-        return true
+        return true;
     }
 
     function getMessageProperty(msg,expr) {
@@ -10190,12 +10915,24 @@ RED.utils = (function() {
                 this.uiContainer.width(m[1]);
             }
             if (this.options.sortable) {
+                var isCanceled = false; // Flag to track if an item has been canceled from being dropped into a different list
+                var noDrop = false; // Flag to track if an item is being dragged into a different list
                 var handle = (typeof this.options.sortable === 'string')?
                                 this.options.sortable :
                                 ".red-ui-editableList-item-handle";
                 var sortOptions = {
                     axis: "y",
                     update: function( event, ui ) {
+                        // dont trigger update if the item is being canceled
+                        const targetList = $(event.target);
+                        const draggedItem = ui.item;
+                        const draggedItemParent = draggedItem.parent();
+                        if (!targetList.is(draggedItemParent) && draggedItem.hasClass("red-ui-editableList-item-constrained")) {
+                            noDrop = true;
+                        }
+                        if (isCanceled || noDrop) {
+                            return;
+                        }
                         if (that.options.sortItems) {
                             that.options.sortItems(that.items());
                         }
@@ -10205,8 +10942,32 @@ RED.utils = (function() {
                     tolerance: "pointer",
                     forcePlaceholderSize:true,
                     placeholder: "red-ui-editabelList-item-placeholder",
-                    start: function(e, ui){
-                        ui.placeholder.height(ui.item.height()-4);
+                    start: function (event, ui) {
+                        isCanceled = false;
+                        ui.placeholder.height(ui.item.height() - 4);
+                        ui.item.css('cursor', 'grabbing'); // TODO: this doesn't seem to work, use a class instead?
+                    },
+                    stop: function (event, ui) {
+                        ui.item.css('cursor', 'auto');
+                    },
+                    receive: function (event, ui) {
+                        if (ui.item.hasClass("red-ui-editableList-item-constrained")) {
+                            isCanceled = true;
+                            $(ui.sender).sortable('cancel');
+                        }
+                    },
+                    over: function (event, ui) {
+                        // if the dragged item is constrained, prevent it from being dropped into a different list
+                        const targetList = $(event.target);
+                        const draggedItem = ui.item;
+                        const draggedItemParent = draggedItem.parent();
+                        if (!targetList.is(draggedItemParent) && draggedItem.hasClass("red-ui-editableList-item-constrained")) {
+                            noDrop = true;
+                            draggedItem.css('cursor', 'no-drop'); // TODO: this doesn't seem to work, use a class instead?
+                        } else {
+                            noDrop = false;
+                            draggedItem.css('cursor', 'grabbing'); // TODO: this doesn't seem to work, use a class instead?
+                        }
                     }
                 };
                 if (this.options.connectWith) {
@@ -12253,7 +13014,7 @@ RED.popover = (function() {
                         closePopup(true);
                     });
                 }
-                if (trigger === 'hover' && options.interactive) {
+                if (/*trigger === 'hover' && */options.interactive) {
                     div.on('mouseenter', function(e) {
                         clearTimeout(timer);
                         active = true;
@@ -12487,9 +13248,12 @@ RED.popover = (function() {
 
     return {
         create: createPopover,
-        tooltip: function(target,content, action) {
+        tooltip: function(target,content, action, interactive) {
             var label = function() {
                 var label = content;
+                if (typeof content === 'function') {
+                    label = content()
+                }
                 if (action) {
                     var shortcut = RED.keyboard.getShortcut(action);
                     if (shortcut && shortcut.key) {
@@ -12505,6 +13269,7 @@ RED.popover = (function() {
                 size: "small",
                 direction: "bottom",
                 content: label,
+                interactive,
                 delay: { show: 750, hide: 50 }
             });
             popover.setContent = function(newContent) {
@@ -13263,7 +14028,10 @@ RED.tabs = (function() {
 
             var thisTabA = thisTab.find("a");
             if (options.onclick) {
-                options.onclick(tabs[thisTabA.attr('href').slice(1)]);
+                options.onclick(tabs[thisTabA.attr('href').slice(1)], evt);
+                if (evt.isDefaultPrevented() && evt.isPropagationStopped()) {
+                    return false
+                }
             }
             activateTab(thisTabA);
             if (fireSelectionChanged) {
@@ -13446,6 +14214,8 @@ RED.tabs = (function() {
         ul.find("li.red-ui-tab a")
             .on("mousedown", function(evt) { mousedownTab = evt.currentTarget })
             .on("mouseup",onTabClick)
+            // prevent browser-default middle-click behaviour
+            .on("auxclick", function(evt) { evt.preventDefault() })
             .on("click", function(evt) {evt.preventDefault(); })
             .on("dblclick", function(evt) {evt.stopPropagation(); evt.preventDefault(); })
 
@@ -13714,6 +14484,8 @@ RED.tabs = (function() {
                 }
                 link.on("mousedown", function(evt) { mousedownTab = evt.currentTarget })
                 link.on("mouseup",onTabClick);
+                // prevent browser-default middle-click behaviour
+                link.on("auxclick", function(evt) { evt.preventDefault() })
                 link.on("click", function(evt) { evt.preventDefault(); })
                 link.on("dblclick", function(evt) { evt.stopPropagation(); evt.preventDefault(); })
 
@@ -14170,25 +14942,26 @@ RED.stack = (function() {
         return icon;
     }
 
-    var autoComplete = function(options) {
-        function getMatch(value, searchValue) {
-            const idx = value.toLowerCase().indexOf(searchValue.toLowerCase());
-            const len = idx > -1 ? searchValue.length : 0;
-            return {
-                index: idx,
-                found: idx > -1,
-                pre: value.substring(0,idx),
-                match: value.substring(idx,idx+len),
-                post: value.substring(idx+len),
-            }
+    function getMatch(value, searchValue) {
+        const idx = value.toLowerCase().indexOf(searchValue.toLowerCase());
+        const len = idx > -1 ? searchValue.length : 0;
+        return {
+            index: idx,
+            found: idx > -1,
+            pre: value.substring(0,idx),
+            match: value.substring(idx,idx+len),
+            post: value.substring(idx+len),
         }
-        function generateSpans(match) {
-            const els = [];
-            if(match.pre) { els.push($('<span/>').text(match.pre)); }
-            if(match.match) { els.push($('<span/>',{style:"font-weight: bold; color: var(--red-ui-text-color-link);"}).text(match.match)); }
-            if(match.post) { els.push($('<span/>').text(match.post)); }
-            return els;
-        }
+    }
+    function generateSpans(match) {
+        const els = [];
+        if(match.pre) { els.push($('<span/>').text(match.pre)); }
+        if(match.match) { els.push($('<span/>',{style:"font-weight: bold; color: var(--red-ui-text-color-link);"}).text(match.match)); }
+        if(match.post) { els.push($('<span/>').text(match.post)); }
+        return els;
+    }
+    
+    const msgAutoComplete = function(options) {
         return function(val) {
             var matches = [];
             options.forEach(opt => {
@@ -14215,6 +14988,197 @@ RED.stack = (function() {
             })
             matches.sort(function(A,B){return A.i-B.i})
             return matches;
+        }
+    }
+
+    function getEnvVars (obj, envVars = {}) {
+        contextKnownKeys.env = contextKnownKeys.env || {}
+        if (contextKnownKeys.env[obj.id]) {
+            return contextKnownKeys.env[obj.id]
+        }
+        let parent
+        if (obj.type === 'tab' || obj.type === 'subflow') {
+            RED.nodes.eachConfig(function (conf) {
+                if (conf.type === "global-config") {
+                    parent = conf;
+                }
+            })
+        } else if (obj.g) {
+            parent = RED.nodes.group(obj.g)
+        } else if (obj.z) {
+            parent = RED.nodes.workspace(obj.z) || RED.nodes.subflow(obj.z)
+        }
+        if (parent) {
+            getEnvVars(parent, envVars)
+        }
+        if (obj.env) {
+            obj.env.forEach(env => {
+                envVars[env.name] = obj
+            })
+        }
+        contextKnownKeys.env[obj.id] = envVars
+        return envVars
+    }
+
+    const envAutoComplete = function (val) {
+        const editStack = RED.editor.getEditStack()
+        if (editStack.length === 0) {
+            done([])
+            return
+        }
+        const editingNode = editStack.pop()
+        if (!editingNode) {
+            return []
+        }
+        const envVarsMap = getEnvVars(editingNode)
+        const envVars = Object.keys(envVarsMap)
+        const matches = []
+        const i = val.lastIndexOf('${')
+        let searchKey = val
+        let isSubkey = false
+        if (i > -1) {
+            if (val.lastIndexOf('}') < i) {
+                searchKey = val.substring(i+2)
+                isSubkey = true
+            }
+        }
+        envVars.forEach(v => {
+            let valMatch = getMatch(v, searchKey);
+            if (valMatch.found) {
+                const optSrc = envVarsMap[v]
+                const element = $('<div>',{style: "display: flex"});
+                const valEl = $('<div/>',{style:"font-family: var(--red-ui-monospace-font); white-space:nowrap; overflow: hidden; flex-grow:1"});
+                valEl.append(generateSpans(valMatch))
+                valEl.appendTo(element)
+
+                if (optSrc) {
+                    const optEl = $('<div>').css({ "font-size": "0.8em" });
+                    let label
+                    if (optSrc.type === 'global-config') {
+                        label = RED._('sidebar.context.global')
+                    } else if (optSrc.type === 'group') {
+                        label = RED.utils.getNodeLabel(optSrc) || (RED._('sidebar.info.group') + ': '+optSrc.id)
+                    } else {
+                        label = RED.utils.getNodeLabel(optSrc) || optSrc.id
+                    }
+
+                    optEl.append(generateSpans({ match: label }));
+                    optEl.appendTo(element);
+                }
+                matches.push({
+                    value: isSubkey ? val + v + '}' : v,
+                    label: element,
+                    i: valMatch.index
+                });
+            }
+        })
+        matches.sort(function(A,B){return A.i-B.i})
+        return matches
+    }
+
+    let contextKnownKeys = {}
+    let contextCache = {}
+    if (RED.events) {
+        RED.events.on("editor:close", function () {
+            contextCache = {}
+            contextKnownKeys = {}
+        });
+    }
+
+    const contextAutoComplete = function() {
+        const that = this
+        const getContextKeysFromRuntime = function(scope, store, searchKey, done) {
+            contextKnownKeys[scope] = contextKnownKeys[scope] || {}
+            contextKnownKeys[scope][store] = contextKnownKeys[scope][store] || new Set()
+            if (searchKey.length > 0) {
+                try {
+                    RED.utils.normalisePropertyExpression(searchKey)
+                } catch (err) {
+                    // Not a valid context key, so don't try looking up
+                    done()
+                    return
+                }
+            }
+            const url = `context/${scope}/${encodeURIComponent(searchKey)}?store=${store}&keysOnly`
+            if (contextCache[url]) {
+                // console.log('CACHED', url)
+                done()
+            } else {
+                // console.log('GET', url)
+                $.getJSON(url, function(data) {
+                    // console.log(data)
+                    contextCache[url] = true
+                    const result = data[store] || {}
+                    const keys = result.keys || []
+                    const keyPrefix = searchKey + (searchKey.length > 0 ? '.' : '')
+                    keys.forEach(key => {
+                        if (/^[a-zA-Z_$][0-9a-zA-Z_$]*$/.test(key)) {
+                            contextKnownKeys[scope][store].add(keyPrefix + key)
+                        } else {
+                            contextKnownKeys[scope][store].add(searchKey + "[\""+key.replace(/"/,"\\\"")+"\"]")
+                        }                        
+                    })
+                    done()
+                })
+            }
+        }
+        const getContextKeys = function(key, done) {
+            const keyParts = key.split('.')
+            const partialKey = keyParts.pop()
+            let scope = that.propertyType
+            if (scope === 'flow') {
+                // Get the flow id of the node we're editing
+                const editStack = RED.editor.getEditStack()
+                if (editStack.length === 0) {
+                    done([])
+                    return
+                }
+                const editingNode = editStack.pop()
+                if (editingNode.z) {
+                    scope = `${scope}/${editingNode.z}`
+                } else {
+                    done([])
+                    return
+                }
+            }
+            const store = (contextStoreOptions.length === 1) ? contextStoreOptions[0].value : that.optionValue
+            const searchKey = keyParts.join('.')
+           
+            getContextKeysFromRuntime(scope, store, searchKey, function() {
+                if (contextKnownKeys[scope][store].has(key) || key.endsWith(']')) {
+                    getContextKeysFromRuntime(scope, store, key, function() {
+                        done(contextKnownKeys[scope][store])
+                    })
+                }
+                done(contextKnownKeys[scope][store])
+            })
+        }
+
+        return function(val, done) {
+            getContextKeys(val, function (keys) {
+                const matches = []
+                keys.forEach(v => {
+                    let optVal = v
+                    let valMatch = getMatch(optVal, val);
+                    if (!valMatch.found && val.length > 0 && val.endsWith('.')) {
+                        // Search key ends in '.' - but doesn't match. Check again
+                        // with [" at the end instead so we match bracket notation
+                        valMatch = getMatch(optVal, val.substring(0, val.length - 1) + '["')
+                    }
+                    if (valMatch.found) {
+                        const element = $('<div>',{style: "display: flex"});
+                        const valEl = $('<div/>',{style:"font-family: var(--red-ui-monospace-font); white-space:nowrap; overflow: hidden; flex-grow:1"});
+                        valEl.append(generateSpans(valMatch))
+                        valEl.appendTo(element)
+                        matches.push({
+                            value: optVal,
+                            label: element,
+                        });
+                    }
+                })
+                matches.sort(function(a, b) { return a.value.localeCompare(b.value) });
+                done(matches);
+            })
         }
     }
 
@@ -14282,68 +15246,93 @@ RED.stack = (function() {
         { value: "_session", source: ["websocket out","tcp out"] },
     ]
     var allOptions = {
-        msg: {value:"msg",label:"msg.",validate:RED.utils.validatePropertyExpression, autoComplete: autoComplete(msgCompletions)},
-        flow: {value:"flow",label:"flow.",hasValue:true,
-            options:[],
-            validate:RED.utils.validatePropertyExpression,
+        msg: { value: "msg", label: "msg.", validate: RED.utils.validatePropertyExpression, autoComplete: msgAutoComplete(msgCompletions) },
+        flow: { value: "flow", label: "flow.", hasValue: true,
+            options: [],
+            validate: RED.utils.validatePropertyExpression,
             parse: contextParse,
             export: contextExport,
-            valueLabel: contextLabel
+            valueLabel: contextLabel,
+            autoComplete: contextAutoComplete
         },
-        global: {value:"global",label:"global.",hasValue:true,
-            options:[],
-            validate:RED.utils.validatePropertyExpression,
+        global: {
+            value: "global", label: "global.", hasValue: true,
+            options: [],
+            validate: RED.utils.validatePropertyExpression,
             parse: contextParse,
             export: contextExport,
-            valueLabel: contextLabel
+            valueLabel: contextLabel,
+            autoComplete: contextAutoComplete
         },
-        str: {value:"str",label:"string",icon:"red/images/typedInput/az.svg"},
-        num: {value:"num",label:"number",icon:"red/images/typedInput/09.svg",validate: function(v) {
-            return (true === RED.utils.validateTypedProperty(v, "num"));
+        str: { value: "str", label: "string", icon: "red/images/typedInput/az.svg" },
+        num: { value: "num", label: "number", icon: "red/images/typedInput/09.svg", validate: function (v, o) {
+            return RED.utils.validateTypedProperty(v, "num", o);
         } },
-        bool: {value:"bool",label:"boolean",icon:"red/images/typedInput/bool.svg",options:["true","false"]},
+        bool: { value: "bool", label: "boolean", icon: "red/images/typedInput/bool.svg", options: ["true", "false"] },
         json: {
-            value:"json",
-            label:"JSON",
-            icon:"red/images/typedInput/json.svg",
-            validate: function(v) { try{JSON.parse(v);return true;}catch(e){return false;}},
-            expand: function() {
+            value: "json",
+            label: "JSON",
+            icon: "red/images/typedInput/json.svg",
+            validate: function (v, o) {
+                return RED.utils.validateTypedProperty(v, "json", o);
+            },
+            expand: function () {
                 var that = this;
                 var value = this.value();
                 try {
-                    value = JSON.stringify(JSON.parse(value),null,4);
-                } catch(err) {
+                    value = JSON.stringify(JSON.parse(value), null, 4);
+                } catch (err) {
                 }
                 RED.editor.editJSON({
                     value: value,
                     stateId: RED.editor.generateViewStateId("typedInput", that, "json"),
                     focus: true,
-                    complete: function(v) {
+                    complete: function (v) {
                         var value = v;
                         try {
                             value = JSON.stringify(JSON.parse(v));
-                        } catch(err) {
+                        } catch (err) {
                         }
                         that.value(value);
                     }
                 })
             }
         },
-        re: {value:"re",label:"regular expression",icon:"red/images/typedInput/re.svg"},
-        date: {value:"date",label:"timestamp",icon:"fa fa-clock-o",hasValue:false},
+        re: { value: "re", label: "regular expression", icon: "red/images/typedInput/re.svg" },
+        date: {
+            value: "date",
+            label: "timestamp",
+            icon: "fa fa-clock-o",
+            options: [
+                {
+                    label: 'milliseconds since epoch',
+                    value: ''
+                },
+                {
+                    label: 'YYYY-MM-DDTHH:mm:ss.sssZ',
+                    value: 'iso'
+                },
+                {
+                    label: 'JavaScript Date Object',
+                    value: 'object'
+                }
+            ]
+        },
         jsonata: {
             value: "jsonata",
             label: "expression",
             icon: "red/images/typedInput/expr.svg",
-            validate: function(v) { try{jsonata(v);return true;}catch(e){return false;}},
-            expand:function() {
+            validate: function (v, o) {
+                return RED.utils.validateTypedProperty(v, "jsonata", o);
+            },
+            expand: function () {
                 var that = this;
                 RED.editor.editExpression({
-                    value: this.value().replace(/\t/g,"\n"),
+                    value: this.value().replace(/\t/g, "\n"),
                     stateId: RED.editor.generateViewStateId("typedInput", that, "jsonata"),
                     focus: true,
-                    complete: function(v) {
-                        that.value(v.replace(/\n/g,"\t"));
+                    complete: function (v) {
+                        that.value(v.replace(/\n/g, "\t"));
                     }
                 })
             }
@@ -14352,13 +15341,13 @@ RED.stack = (function() {
             value: "bin",
             label: "buffer",
             icon: "red/images/typedInput/bin.svg",
-            expand: function() {
+            expand: function () {
                 var that = this;
                 RED.editor.editBuffer({
                     value: this.value(),
                     stateId: RED.editor.generateViewStateId("typedInput", that, "bin"),
                     focus: true,
-                    complete: function(v) {
+                    complete: function (v) {
                         that.value(v);
                     }
                 })
@@ -14367,15 +15356,16 @@ RED.stack = (function() {
         env: {
             value: "env",
             label: "env variable",
-            icon: "red/images/typedInput/env.svg"
+            icon: "red/images/typedInput/env.svg",
+            autoComplete: envAutoComplete
         },
         node: {
             value: "node",
             label: "node",
             icon: "red/images/typedInput/target.svg",
-            valueLabel: function(container,value) {
+            valueLabel: function (container, value) {
                 var node = RED.nodes.node(value);
-                var nodeDiv = $('<div>',{class:"red-ui-search-result-node"}).css({
+                var nodeDiv = $('<div>', { class: "red-ui-search-result-node" }).css({
                     "margin-top": "2px",
                     "margin-left": "3px"
                 }).appendTo(container);
@@ -14384,133 +15374,190 @@ RED.stack = (function() {
                     "margin-left": "6px"
                 }).appendTo(container);
                 if (node) {
-                    var colour = RED.utils.getNodeColor(node.type,node._def);
-                    var icon_url = RED.utils.getNodeIcon(node._def,node);
+                    var colour = RED.utils.getNodeColor(node.type, node._def);
+                    var icon_url = RED.utils.getNodeIcon(node._def, node);
                     if (node.type === 'tab') {
                         colour = "#C0DEED";
                     }
-                    nodeDiv.css('backgroundColor',colour);
-                    var iconContainer = $('<div/>',{class:"red-ui-palette-icon-container"}).appendTo(nodeDiv);
+                    nodeDiv.css('backgroundColor', colour);
+                    var iconContainer = $('<div/>', { class: "red-ui-palette-icon-container" }).appendTo(nodeDiv);
                     RED.utils.createIconElement(icon_url, iconContainer, true);
-                    var l = RED.utils.getNodeLabel(node,node.id);
+                    var l = RED.utils.getNodeLabel(node, node.id);
                     nodeLabel.text(l);
                 } else {
                     nodeDiv.css({
                         'backgroundColor': '#eee',
-                        'border-style' : 'dashed'
+                        'border-style': 'dashed'
                     });
 
                 }
             },
-            expand: function() {
+            expand: function () {
                 var that = this;
                 RED.tray.hide();
                 RED.view.selectNodes({
                     single: true,
                     selected: [that.value()],
-                    onselect: function(selection) {
+                    onselect: function (selection) {
                         that.value(selection.id);
                         RED.tray.show();
                     },
-                    oncancel: function() {
+                    oncancel: function () {
                         RED.tray.show();
                     }
                 })
             }
         },
-        cred:{
-            value:"cred",
-            label:"credential",
-            icon:"fa fa-lock",
+        cred: {
+            value: "cred",
+            label: "credential",
+            icon: "fa fa-lock",
             inputType: "password",
-            valueLabel: function(container,value) {
+            valueLabel: function (container, value) {
                 var that = this;
-                container.css("pointer-events","none");
-                container.css("flex-grow",0);
+                container.css("pointer-events", "none");
+                container.css("flex-grow", 0);
                 this.elementDiv.hide();
                 var buttons = $('<div>').css({
                     position: "absolute",
-                    right:"6px",
+                    right: "6px",
                     top: "6px",
-                    "pointer-events":"all"
+                    "pointer-events": "all"
                 }).appendTo(container);
                 var eyeButton = $('<button type="button" class="red-ui-button red-ui-button-small"></button>').css({
-                    width:"20px"
-                }).appendTo(buttons).on("click", function(evt) {
+                    width: "20px"
+                }).appendTo(buttons).on("click", function (evt) {
                     evt.preventDefault();
                     var cursorPosition = that.input[0].selectionStart;
                     var currentType = that.input.attr("type");
                     if (currentType === "text") {
-                        that.input.attr("type","password");
+                        that.input.attr("type", "password");
                         eyeCon.removeClass("fa-eye-slash").addClass("fa-eye");
-                        setTimeout(function() {
+                        setTimeout(function () {
                             that.input.focus();
                             that.input[0].setSelectionRange(cursorPosition, cursorPosition);
-                        },50);
+                        }, 50);
                     } else {
-                        that.input.attr("type","text");
+                        that.input.attr("type", "text");
                         eyeCon.removeClass("fa-eye").addClass("fa-eye-slash");
-                        setTimeout(function() {
+                        setTimeout(function () {
                             that.input.focus();
                             that.input[0].setSelectionRange(cursorPosition, cursorPosition);
-                        },50);
+                        }, 50);
                     }
                 }).hide();
-                var eyeCon = $('<i class="fa fa-eye"></i>').css("margin-left","-2px").appendTo(eyeButton);
+                var eyeCon = $('<i class="fa fa-eye"></i>').css("margin-left", "-2px").appendTo(eyeButton);
 
                 if (value === "__PWRD__") {
                     var innerContainer = $('<div><i class="fa fa-asterisk"></i><i class="fa fa-asterisk"></i><i class="fa fa-asterisk"></i><i class="fa fa-asterisk"></i><i class="fa fa-asterisk"></i></div>').css({
-                        padding:"6px 6px",
-                        borderRadius:"4px"
+                        padding: "6px 6px",
+                        borderRadius: "4px"
                     }).addClass("red-ui-typedInput-value-label-inactive").appendTo(container);
-                    var editButton = $('<button type="button" class="red-ui-button red-ui-button-small"><i class="fa fa-pencil"></i></button>').appendTo(buttons).on("click", function(evt) {
+                    var editButton = $('<button type="button" class="red-ui-button red-ui-button-small"><i class="fa fa-pencil"></i></button>').appendTo(buttons).on("click", function (evt) {
                         evt.preventDefault();
                         innerContainer.hide();
-                        container.css("background","none");
-                        container.css("pointer-events","none");
+                        container.css("background", "none");
+                        container.css("pointer-events", "none");
                         that.input.val("");
                         that.element.val("");
                         that.elementDiv.show();
                         editButton.hide();
                         cancelButton.show();
                         eyeButton.show();
-                        setTimeout(function() {
+                        setTimeout(function () {
                             that.input.focus();
-                        },50);
+                        }, 50);
                     });
-                    var cancelButton = $('<button type="button" class="red-ui-button red-ui-button-small"><i class="fa fa-times"></i></button>').css("margin-left","3px").appendTo(buttons).on("click", function(evt) {
+                    var cancelButton = $('<button type="button" class="red-ui-button red-ui-button-small"><i class="fa fa-times"></i></button>').css("margin-left", "3px").appendTo(buttons).on("click", function (evt) {
                         evt.preventDefault();
                         innerContainer.show();
-                        container.css("background","");
+                        container.css("background", "");
                         that.input.val("__PWRD__");
                         that.element.val("__PWRD__");
                         that.elementDiv.hide();
                         editButton.show();
                         cancelButton.hide();
                         eyeButton.hide();
-                        that.input.attr("type","password");
+                        that.input.attr("type", "password");
                         eyeCon.removeClass("fa-eye-slash").addClass("fa-eye");
 
                     }).hide();
                 } else {
-                    container.css("background","none");
-                    container.css("pointer-events","none");
+                    container.css("background", "none");
+                    container.css("pointer-events", "none");
                     this.elementDiv.show();
                     eyeButton.show();
                 }
             }
+        },
+        'conf-types': {
+            value: "conf-types",
+            label: "config",
+            icon: "fa fa-cog",
+            // hasValue: false,
+            valueLabel: function (container, value) {
+                // get the selected option (for access to the "name" and "module" properties)
+                const _options = this._optionsCache || this.typeList.find(opt => opt.value === value)?.options || []
+                const selectedOption = _options.find(opt => opt.value === value) || {
+                    title: '',
+                    name: '',
+                    module: ''
+                }
+                container.attr("title", selectedOption.title) // set tooltip to the full path/id of the module/node
+                container.text(selectedOption.name) // apply the "name" of the selected option
+                // set "line-height" such as to make the "name" appear further up, giving room for the "module" to be displayed below the value
+                container.css("line-height", "1.4em")
+                // add the module name in smaller, lighter font below the value
+                $('<div></div>').text(selectedOption.module).css({
+                    // "font-family": "var(--red-ui-monospace-font)",
+                    color: "var(--red-ui-tertiary-text-color)",
+                    "font-size": "0.8em",
+                    "line-height": "1em",
+                    opacity: 0.8
+                }).appendTo(container);
+            },
+            // hasValue: false,
+            options: function () {
+                if (this._optionsCache) {
+                    return this._optionsCache
+                }
+                const configNodes = RED.nodes.registry.getNodeDefinitions({configOnly: true, filter: (def) => def.type !== "global-config"}).map((def) => {
+                    // create a container with with 2 rows (row 1 for the name, row 2 for the module name in smaller, lighter font)
+                    const container = $('<div style="display: flex; flex-direction: column; justify-content: space-between; row-gap: 1px;">')
+                    const row1Name = $('<div>').text(def.type)
+                    const row2Module = $('<div style="font-size: 0.8em; color: var(--red-ui-tertiary-text-color);">').text(def.set.module)
+                    container.append(row1Name, row2Module)
+        
+                    return {
+                        value: def.type,
+                        name: def.type,
+                        enabled: def.set.enabled ?? true,
+                        local: def.set.local,
+                        title: def.set.id, // tooltip e.g. "node-red-contrib-foo/bar"
+                        module: def.set.module,
+                        icon: container[0].outerHTML.trim(), // the typeInput will interpret this as html text and render it in the anchor
+                    }
+                })
+                this._optionsCache = configNodes
+                return configNodes
+            }
         }
     };
 
+    
     // For a type with options, check value is a valid selection
     // If !opt.multiple, returns the valid option object
     // if opt.multiple, returns an array of valid option objects
     // If not valid, returns null;
 
     function isOptionValueValid(opt, currentVal) {
+        let _options = opt.options
+        if (typeof _options === "function") {
+            _options = _options.call(this)
+        }
         if (!opt.multiple) {
-            for (var i=0;i<opt.options.length;i++) {
-                op = opt.options[i];
+            for (var i=0;i<_options.length;i++) {
+                op = _options[i];
                 if (typeof op === "string" && op === currentVal) {
                     return {value:currentVal}
                 } else if (op.value === currentVal) {
@@ -14527,8 +15574,8 @@ RED.stack = (function() {
                     currentValues[v] = true;
                 }
             });
-            for (var i=0;i<opt.options.length;i++) {
-                op = opt.options[i];
+            for (var i=0;i<_options.length;i++) {
+                op = _options[i];
                 var val = typeof op === "string" ? op : op.value;
                 if (currentValues.hasOwnProperty(val)) {
                     delete currentValues[val];
@@ -14543,6 +15590,7 @@ RED.stack = (function() {
     }
 
     var nlsd = false;
+    let contextStoreOptions;
 
     $.widget( "nodered.typedInput", {
         _create: function() {
@@ -14554,7 +15602,7 @@ RED.stack = (function() {
                     }
                 }
                 var contextStores = RED.settings.context.stores;
-                var contextOptions = contextStores.map(function(store) {
+                contextStoreOptions = contextStores.map(function(store) {
                     return {value:store,label: store, icon:'<i class="red-ui-typedInput-icon fa fa-database"></i>'}
                 }).sort(function(A,B) {
                     if (A.value === RED.settings.context.default) {
@@ -14565,13 +15613,17 @@ RED.stack = (function() {
                         return A.value.localeCompare(B.value);
                     }
                 })
-                if (contextOptions.length < 2) {
+                if (contextStoreOptions.length < 2) {
                     allOptions.flow.options = [];
                     allOptions.global.options = [];
                 } else {
-                    allOptions.flow.options = contextOptions;
-                    allOptions.global.options = contextOptions;
+                    allOptions.flow.options = contextStoreOptions;
+                    allOptions.global.options = contextStoreOptions;
                 }
+                // Translate timestamp options
+                allOptions.date.options.forEach(opt => {
+                    opt.label = RED._("typedInput.date.format." + (opt.value || 'timestamp'), {defaultValue: opt.label})
+                })
             }
             nlsd = true;
             var that = this;
@@ -14660,7 +15712,7 @@ RED.stack = (function() {
                 that.element.trigger('paste',evt);
             });
             this.input.on('keydown', function(evt) {
-                if (that.typeMap[that.propertyType].autoComplete) {
+                if (that.typeMap[that.propertyType].autoComplete || that.input.hasClass('red-ui-autoComplete')) {
                     return
                 }
                 if (evt.keyCode >= 37 && evt.keyCode <= 40) {
@@ -14954,7 +16006,9 @@ RED.stack = (function() {
             if (this.optionMenu) {
                 this.optionMenu.remove();
             }
-            this.menu.remove();
+            if (this.menu) {
+                this.menu.remove();
+            }
             this.uiSelect.remove();
         },
         types: function(types) {
@@ -14987,7 +16041,7 @@ RED.stack = (function() {
             this.menu = this._createMenu(this.typeList,{},function(v) { that.type(v) });
             if (currentType && !this.typeMap.hasOwnProperty(currentType)) {
                 if (!firstCall) {
-                    this.type(this.typeList[0].value);
+                    this.type(this.typeList[0]?.value || ""); // permit empty typeList
                 }
             } else {
                 this.propertyType = null;
@@ -15024,6 +16078,11 @@ RED.stack = (function() {
                 var selectedOption = [];
                 var valueToCheck = value;
                 if (opt.options) {
+                    let _options = opt.options
+                    if (typeof opt.options === "function") {
+                        _options = opt.options.call(this)
+                    }
+
                     if (opt.hasValue && opt.parse) {
                         var parts = opt.parse(value);
                         if (this.options.debug) { console.log(this.identifier,"new parse",parts) }
@@ -15037,8 +16096,8 @@ RED.stack = (function() {
                         checkValues = valueToCheck.split(",");
                     }
                     checkValues.forEach(function(valueToCheck) {
-                        for (var i=0;i<opt.options.length;i++) {
-                            var op = opt.options[i];
+                        for (var i=0;i<_options.length;i++) {
+                            var op = _options[i];
                             if (typeof op === "string") {
                                 if (op === valueToCheck || op === ""+valueToCheck) {
                                     selectedOption.push(that.activeOptions[op]);
@@ -15073,7 +16132,7 @@ RED.stack = (function() {
         },
         type: function(type) {
             if (!arguments.length) {
-                return this.propertyType;
+                return this.propertyType || this.options?.default || '';
             } else {
                 var that = this;
                 if (this.options.debug) { console.log(this.identifier,"----- SET TYPE -----",type) }
@@ -15083,6 +16142,9 @@ RED.stack = (function() {
                     // If previousType is !null, then this is a change of the type, rather than the initialisation
                     var previousType = this.typeMap[this.propertyType];
                     previousValue = this.input.val();
+                    if (this.input.hasClass('red-ui-autoComplete')) {
+                        this.input.autoComplete("destroy");
+                    }
 
                     if (previousType && this.typeChanged) {
                         if (this.options.debug) { console.log(this.identifier,"typeChanged",{previousType,previousValue}) }
@@ -15129,7 +16191,9 @@ RED.stack = (function() {
                             this.input.val(this.oldValues.hasOwnProperty("_")?this.oldValues["_"]:(opt.default||""))
                         }
                         if (previousType.autoComplete) {
-                            this.input.autoComplete("destroy");
+                            if (this.input.hasClass('red-ui-autoComplete')) {
+                                this.input.autoComplete("destroy");
+                            }
                         }
                     }
                     this.propertyType = type;
@@ -15169,6 +16233,10 @@ RED.stack = (function() {
                         this.optionMenu = null;
                     }
                     if (opt.options) {
+                        let _options = opt.options
+                        if (typeof _options === "function") {
+                            _options = opt.options.call(this);
+                        }
                         if (this.optionExpandButton) {
                             this.optionExpandButton.hide();
                             this.optionExpandButton.shown = false;
@@ -15185,7 +16253,7 @@ RED.stack = (function() {
                                 this.valueLabelContainer.hide();
                             }
                             this.activeOptions = {};
-                            opt.options.forEach(function(o) {
+                            _options.forEach(function(o) {
                                 if (typeof o === 'string') {
                                     that.activeOptions[o] = {label:o,value:o};
                                 } else {
@@ -15205,7 +16273,7 @@ RED.stack = (function() {
                                     if (validValues) {
                                         that._updateOptionSelectLabel(validValues)
                                     } else {
-                                        op = opt.options[0];
+                                        op = _options[0] || {value:""}; // permit zero options
                                         if (typeof op === "string") {
                                             this.value(op);
                                             that._updateOptionSelectLabel({value:op});
@@ -15224,7 +16292,7 @@ RED.stack = (function() {
                                     that._updateOptionSelectLabel(validValues);
                                 }
                             } else {
-                                var selectedOption = this.optionValue||opt.options[0];
+                                var selectedOption = this.optionValue||_options[0];
                                 if (opt.parse) {
                                     var selectedOptionObj = typeof selectedOption === "string"?{value:selectedOption}:selectedOption
                                     var parts = opt.parse(this.input.val(),selectedOptionObj);
@@ -15257,8 +16325,18 @@ RED.stack = (function() {
                                 } else {
                                     this.optionSelectTrigger.hide();
                                 }
+                                if (opt.autoComplete) {
+                                    let searchFunction = opt.autoComplete
+                                    if (searchFunction.length === 0) {
+                                        searchFunction = opt.autoComplete.call(this)
+                                    }
+                                    this.input.autoComplete({
+                                        search: searchFunction,
+                                        minLength: 0
+                                    })
+                                }
                             }
-                            this.optionMenu = this._createMenu(opt.options,opt,function(v){
+                            this.optionMenu = this._createMenu(_options,opt,function(v){
                                 if (!opt.multiple) {
                                     that._updateOptionSelectLabel(that.activeOptions[v]);
                                     if (!opt.hasValue) {
@@ -15299,8 +16377,12 @@ RED.stack = (function() {
                             this.valueLabelContainer.hide();
                             this.elementDiv.show();
                             if (opt.autoComplete) {
+                                let searchFunction = opt.autoComplete
+                                if (searchFunction.length === 0) {
+                                    searchFunction = opt.autoComplete.call(this)
+                                }
                                 this.input.autoComplete({
-                                    search: opt.autoComplete,
+                                    search: searchFunction,
                                     minLength: 0
                                 })
                             }
@@ -15349,26 +16431,48 @@ RED.stack = (function() {
                 }
             }
         },
-        validate: function() {
-            var result;
-            var value = this.value();
-            var type = this.type();
+        validate: function(options) {
+            let valid = true;
+            const value = this.value();
+            const type = this.type();
             if (this.typeMap[type] && this.typeMap[type].validate) {
-                var val = this.typeMap[type].validate;
-                if (typeof val === 'function') {
-                    result = val(value);
+                const validate = this.typeMap[type].validate;
+                if (typeof validate === 'function') {
+                    valid = validate(value, {});
                 } else {
-                    result = val.test(value);
+                    // Regex
+                    valid = validate.test(value);
+                    if (!valid) {
+                        valid = RED._("validator.errors.invalid-regexp");
+                    }
+                }
+            }
+            if ((typeof valid === "string") || !valid) {
+                this.element.addClass("input-error");
+                this.uiSelect.addClass("input-error");
+                if (typeof valid === "string") {
+                    let tooltip = this.element.data("tooltip");
+                    if (tooltip) {
+                        tooltip.setContent(valid);
+                    } else {
+                        tooltip = RED.popover.tooltip(this.elementDiv, valid);
+                        this.element.data("tooltip", tooltip);
+                    }
                 }
             } else {
-                result = true;
+                this.element.removeClass("input-error");
+                this.uiSelect.removeClass("input-error");
+                const tooltip = this.element.data("tooltip");
+                if (tooltip) {
+                    this.element.data("tooltip", null);
+                    tooltip.delete();
+                }
             }
-            if (result) {
-                this.uiSelect.removeClass('input-error');
-            } else {
-                this.uiSelect.addClass('input-error');
+            if (options?.returnErrorMessage === true) {
+                return valid;
             }
-            return result;
+            // Must return a boolean for no 3.x validator
+            return (typeof valid === "string") ? false : valid;
         },
         show: function() {
             this.uiSelect.show();
@@ -15776,6 +16880,8 @@ RED.deploy = (function() {
 
     var currentDiff = null;
 
+    var activeBackgroundDeployNotification;
+
     function changeDeploymentType(type) {
         deploymentType = type;
         $("#red-ui-header-button-deploy-icon").attr("src",deploymentTypes[type].img);
@@ -15803,7 +16909,7 @@ RED.deploy = (function() {
                  '<img src="red/images/spin.svg"/>'+
                 '</span>'+
               '</a>'+
-              '<a id="red-ui-header-button-deploy-options" class="red-ui-deploy-button" href="#"><i class="fa fa-caret-down"></i></a>'+
+              '<a id="red-ui-header-button-deploy-options" class="red-ui-deploy-button" href="#"><i class="fa fa-caret-down"></i><i class="fa fa-lock"></i></a>'+
               '</span></li>').prependTo(".red-ui-header-toolbar");
             const mainMenuItems = [
                     {id:"deploymenu-item-full",toggle:"deploy-type",icon:"red/images/deploy-full.svg",label:RED._("deploy.full"),sublabel:RED._("deploy.fullDesc"),selected: true, onselect:function(s) { if(s){changeDeploymentType("full")}}},
@@ -15854,49 +16960,71 @@ RED.deploy = (function() {
             RED.actions.add("core:set-deploy-type-to-modified-nodes",function() { RED.menu.setSelected("deploymenu-item-node",true); });
         }
 
-
-
         RED.events.on('workspace:dirty',function(state) {
+            if (RED.settings.user?.permissions === 'read') {
+                return
+            }
             if (state.dirty) {
+                // window.onbeforeunload = function() {
+                //     return 
+                // }
                 $("#red-ui-header-button-deploy").removeClass("disabled");
             } else {
+                // window.onbeforeunload = null;
                 $("#red-ui-header-button-deploy").addClass("disabled");
             }
         });
 
-        var activeNotifyMessage;
         RED.comms.subscribe("notification/runtime-deploy",function(topic,msg) {
-            if (!activeNotifyMessage) {
-                var currentRev = RED.nodes.version();
-                if (currentRev === null || deployInflight || currentRev === msg.revision) {
-                    return;
-                }
-                var message = $('<p>').text(RED._('deploy.confirm.backgroundUpdate'));
-                activeNotifyMessage = RED.notify(message,{
-                    modal: true,
-                    fixed: true,
-                    buttons: [
-                        {
-                            text: RED._('deploy.confirm.button.ignore'),
-                            click: function() {
-                                activeNotifyMessage.close();
-                                activeNotifyMessage = null;
-                            }
-                        },
-                        {
-                            text: RED._('deploy.confirm.button.review'),
-                            class: "primary",
-                            click: function() {
-                                activeNotifyMessage.close();
-                                var nns = RED.nodes.createCompleteNodeSet();
-                                resolveConflict(nns,false);
-                                activeNotifyMessage = null;
-                            }
+            var currentRev = RED.nodes.version();
+            if (currentRev === null || deployInflight || currentRev === msg.revision) {
+                return;
+            }
+            if (activeBackgroundDeployNotification?.hidden && !activeBackgroundDeployNotification?.closed) {
+                activeBackgroundDeployNotification.showNotification()
+                return
+            }
+            const message = $('<p>').text(RED._('deploy.confirm.backgroundUpdate'));
+            const options = {
+                id: 'background-update',
+                type: 'compact',
+                modal: false,
+                fixed: true,
+                timeout: 10000,
+                buttons: [
+                    {
+                        text: RED._('deploy.confirm.button.review'),
+                        class: "primary",
+                        click: function() {
+                            activeBackgroundDeployNotification.hideNotification();
+                            var nns = RED.nodes.createCompleteNodeSet();
+                            resolveConflict(nns,false);
                         }
-                    ]
-                });
+                    }
+                ]
+            }
+            if (!activeBackgroundDeployNotification || activeBackgroundDeployNotification.closed) {
+                activeBackgroundDeployNotification = RED.notify(message, options)
+            } else {
+                activeBackgroundDeployNotification.update(message, options)
             }
         });
+
+
+        updateLockedState()
+        RED.events.on('login', updateLockedState)
+    }
+
+    function updateLockedState() {
+        if (RED.settings.user?.permissions === 'read') {
+            $(".red-ui-deploy-button-group").addClass("readOnly");
+            $("#red-ui-header-button-deploy").addClass("disabled");
+        } else {
+            $(".red-ui-deploy-button-group").removeClass("readOnly");
+            if (RED.nodes.dirty()) {
+                $("#red-ui-header-button-deploy").removeClass("disabled");
+            }
+        }
     }
 
     function getNodeInfo(node) {
@@ -15951,7 +17079,11 @@ RED.deploy = (function() {
                 class: "primary disabled",
                 click: function() {
                     if (!$("#red-ui-deploy-dialog-confirm-deploy-review").hasClass('disabled')) {
-                        RED.diff.showRemoteDiff();
+                        RED.diff.showRemoteDiff(null, {
+                            onmerge: function () {
+                                activeBackgroundDeployNotification.close()
+                            }
+                        });
                         conflictNotification.close();
                     }
                 }
@@ -15964,6 +17096,7 @@ RED.deploy = (function() {
                     if (!$("#red-ui-deploy-dialog-confirm-deploy-merge").hasClass('disabled')) {
                         RED.diff.mergeDiff(currentDiff);
                         conflictNotification.close();
+                        activeBackgroundDeployNotification.close()
                     }
                 }
             }
@@ -15976,6 +17109,7 @@ RED.deploy = (function() {
                 click: function() {
                     save(true,activeDeploy);
                     conflictNotification.close();
+                    activeBackgroundDeployNotification.close()
                 }
             })
         }
@@ -15986,21 +17120,17 @@ RED.deploy = (function() {
             buttons: buttons
         });
 
-        var now = Date.now();
         RED.diff.getRemoteDiff(function(diff) {
-            var ellapsed = Math.max(1000 - (Date.now()-now), 0);
             currentDiff = diff;
-            setTimeout(function() {
-                conflictCheck.hide();
-                var d = Object.keys(diff.conflicts);
-                if (d.length === 0) {
-                    conflictAutoMerge.show();
-                    $("#red-ui-deploy-dialog-confirm-deploy-merge").removeClass('disabled')
-                } else {
-                    conflictManualMerge.show();
-                }
-                $("#red-ui-deploy-dialog-confirm-deploy-review").removeClass('disabled')
-            },ellapsed);
+            conflictCheck.hide();
+            var d = Object.keys(diff.conflicts);
+            if (d.length === 0) {
+                conflictAutoMerge.show();
+                $("#red-ui-deploy-dialog-confirm-deploy-merge").removeClass('disabled')
+            } else {
+                conflictManualMerge.show();
+            }
+            $("#red-ui-deploy-dialog-confirm-deploy-review").removeClass('disabled')
         })
     }
     function cropList(list) {
@@ -16462,7 +17592,6 @@ RED.diagnostics = (function () {
     };
 })();
 ;RED.diff = (function() {
-
     var currentDiff = {};
     var diffVisible = false;
     var diffList;
@@ -16525,12 +17654,14 @@ RED.diagnostics = (function () {
                         addedCount:0,
                         deletedCount:0,
                         changedCount:0,
+                        movedCount:0,
                         unchangedCount: 0
                     },
                     remote: {
                         addedCount:0,
                         deletedCount:0,
                         changedCount:0,
+                        movedCount:0,
                         unchangedCount: 0
                     },
                     conflicts: 0
@@ -16601,7 +17732,7 @@ RED.diagnostics = (function () {
                             $(this).parent().toggleClass('collapsed');
                         });
 
-                        createNodePropertiesTable(def,tab,localTabNode,remoteTabNode,conflicts).appendTo(div);
+                        createNodePropertiesTable(def,tab,localTabNode,remoteTabNode).appendTo(div);
                         selectState = "";
                         if (conflicts[tab.id]) {
                             flowStats.conflicts++;
@@ -16671,19 +17802,26 @@ RED.diagnostics = (function () {
                         var localStats = $('<span>',{class:"red-ui-diff-list-flow-stats"}).appendTo(localCell);
                         $('<span class="red-ui-diff-status"></span>').text(RED._('diff.nodeCount',{count:localNodeCount})).appendTo(localStats);
 
-                        if (flowStats.conflicts + flowStats.local.addedCount + flowStats.local.changedCount + flowStats.local.deletedCount > 0) {
+                        if (flowStats.conflicts + flowStats.local.addedCount + flowStats.local.changedCount + flowStats.local.movedCount + flowStats.local.deletedCount > 0) {
                             $('<span class="red-ui-diff-status"> [ </span>').appendTo(localStats);
                             if (flowStats.conflicts > 0) {
                                 $('<span class="red-ui-diff-status-conflict"><span class="red-ui-diff-status"><i class="fa fa-exclamation"></i> '+flowStats.conflicts+'</span></span>').appendTo(localStats);
                             }
                             if (flowStats.local.addedCount > 0) {
-                                $('<span class="red-ui-diff-status-added"><span class="red-ui-diff-status"><i class="fa fa-plus-square"></i> '+flowStats.local.addedCount+'</span></span>').appendTo(localStats);
+                                const cell = $('<span class="red-ui-diff-status-added"><span class="red-ui-diff-status"><i class="fa fa-plus-square"></i> '+flowStats.local.addedCount+'</span></span>').appendTo(localStats);
+                                RED.popover.tooltip(cell, RED._('diff.type.added'))
                             }
                             if (flowStats.local.changedCount > 0) {
-                                $('<span class="red-ui-diff-status-changed"><span class="red-ui-diff-status"><i class="fa fa-square"></i> '+flowStats.local.changedCount+'</span></span>').appendTo(localStats);
+                                const cell = $('<span class="red-ui-diff-status-changed"><span class="red-ui-diff-status"><i class="fa fa-square"></i> '+flowStats.local.changedCount+'</span></span>').appendTo(localStats);
+                                RED.popover.tooltip(cell, RED._('diff.type.changed'))
+                            }
+                            if (flowStats.local.movedCount > 0) {
+                                const cell = $('<span class="red-ui-diff-status-moved"><span class="red-ui-diff-status"><i class="fa fa-square"></i> '+flowStats.local.movedCount+'</span></span>').appendTo(localStats);
+                                RED.popover.tooltip(cell, RED._('diff.type.moved'))
                             }
                             if (flowStats.local.deletedCount > 0) {
-                                $('<span class="red-ui-diff-status-deleted"><span class="red-ui-diff-status"><i class="fa fa-minus-square"></i> '+flowStats.local.deletedCount+'</span></span>').appendTo(localStats);
+                                const cell = $('<span class="red-ui-diff-status-deleted"><span class="red-ui-diff-status"><i class="fa fa-minus-square"></i> '+flowStats.local.deletedCount+'</span></span>').appendTo(localStats);
+                                RED.popover.tooltip(cell, RED._('diff.type.deleted'))
                             }
                             $('<span class="red-ui-diff-status"> ] </span>').appendTo(localStats);
                         }
@@ -16709,19 +17847,26 @@ RED.diagnostics = (function () {
                             }
                             var remoteStats = $('<span>',{class:"red-ui-diff-list-flow-stats"}).appendTo(remoteCell);
                             $('<span class="red-ui-diff-status"></span>').text(RED._('diff.nodeCount',{count:remoteNodeCount})).appendTo(remoteStats);
-                            if (flowStats.conflicts + flowStats.remote.addedCount + flowStats.remote.changedCount + flowStats.remote.deletedCount > 0) {
+                            if (flowStats.conflicts + flowStats.remote.addedCount + flowStats.remote.changedCount + flowStats.remote.movedCount + flowStats.remote.deletedCount > 0) {
                                 $('<span class="red-ui-diff-status"> [ </span>').appendTo(remoteStats);
                                 if (flowStats.conflicts > 0) {
                                     $('<span class="red-ui-diff-status-conflict"><span class="red-ui-diff-status"><i class="fa fa-exclamation"></i> '+flowStats.conflicts+'</span></span>').appendTo(remoteStats);
                                 }
                                 if (flowStats.remote.addedCount > 0) {
-                                    $('<span class="red-ui-diff-status-added"><span class="red-ui-diff-status"><i class="fa fa-plus-square"></i> '+flowStats.remote.addedCount+'</span></span>').appendTo(remoteStats);
+                                    const cell = $('<span class="red-ui-diff-status-added"><span class="red-ui-diff-status"><i class="fa fa-plus-square"></i> '+flowStats.remote.addedCount+'</span></span>').appendTo(remoteStats);
+                                    RED.popover.tooltip(cell, RED._('diff.type.added'))
                                 }
                                 if (flowStats.remote.changedCount > 0) {
-                                    $('<span class="red-ui-diff-status-changed"><span class="red-ui-diff-status"><i class="fa fa-square"></i> '+flowStats.remote.changedCount+'</span></span>').appendTo(remoteStats);
+                                    const cell = $('<span class="red-ui-diff-status-changed"><span class="red-ui-diff-status"><i class="fa fa-square"></i> '+flowStats.remote.changedCount+'</span></span>').appendTo(remoteStats);
+                                    RED.popover.tooltip(cell, RED._('diff.type.changed'))
+                                }
+                                if (flowStats.remote.movedCount > 0) {
+                                    const cell = $('<span class="red-ui-diff-status-moved"><span class="red-ui-diff-status"><i class="fa fa-square"></i> '+flowStats.remote.movedCount+'</span></span>').appendTo(remoteStats);
+                                    RED.popover.tooltip(cell, RED._('diff.type.moved'))
                                 }
                                 if (flowStats.remote.deletedCount > 0) {
-                                    $('<span class="red-ui-diff-status-deleted"><span class="red-ui-diff-status"><i class="fa fa-minus-square"></i> '+flowStats.remote.deletedCount+'</span></span>').appendTo(remoteStats);
+                                    const cell = $('<span class="red-ui-diff-status-deleted"><span class="red-ui-diff-status"><i class="fa fa-minus-square"></i> '+flowStats.remote.deletedCount+'</span></span>').appendTo(remoteStats);
+                                    RED.popover.tooltip(cell, RED._('diff.type.deleted'))
                                 }
                                 $('<span class="red-ui-diff-status"> ] </span>').appendTo(remoteStats);
                             }
@@ -16756,7 +17901,7 @@ RED.diagnostics = (function () {
         if (options.mode === "merge") {
             diffPanel.addClass("red-ui-diff-panel-merge");
         }
-        var diffList = createDiffTable(diffPanel, diff);
+        var diffList = createDiffTable(diffPanel, diff, options);
 
         var localDiff = diff.localDiff;
         var remoteDiff = diff.remoteDiff;
@@ -16979,7 +18124,6 @@ RED.diagnostics = (function () {
 
         var hasChanges = false; // exists in original and local/remote but with changes
         var unChanged = true; // existing in original,local,remote unchanged
-        var localChanged = false;
 
         if (localDiff.added[node.id]) {
             stats.local.addedCount++;
@@ -16998,12 +18142,20 @@ RED.diagnostics = (function () {
             unChanged = false;
         }
         if (localDiff.changed[node.id]) {
-            stats.local.changedCount++;
+            if (localDiff.positionChanged[node.id]) {
+                stats.local.movedCount++
+            } else {
+                stats.local.changedCount++;
+            }
             hasChanges = true;
             unChanged = false;
         }
         if (remoteDiff && remoteDiff.changed[node.id]) {
-            stats.remote.changedCount++;
+            if (remoteDiff.positionChanged[node.id]) {
+                stats.remote.movedCount++
+            } else {
+                stats.remote.changedCount++;
+            }
             hasChanges = true;
             unChanged = false;
         }
@@ -17068,27 +18220,32 @@ RED.diagnostics = (function () {
                     localNodeDiv.addClass("red-ui-diff-status-moved");
                     var localMovedMessage = "";
                     if (node.z === localN.z) {
-                        localMovedMessage = RED._("diff.type.movedFrom",{id:(localDiff.currentConfig.all[node.id].z||'global')});
+                        const movedFromNodeTab = localDiff.currentConfig.all[localDiff.currentConfig.all[node.id].z]
+                        const movedFromLabel = `'${movedFromNodeTab ? (movedFromNodeTab.label || movedFromNodeTab.id) : 'global'}'`
+                        localMovedMessage = RED._("diff.type.movedFrom",{id: movedFromLabel});
                     } else {
-                        localMovedMessage = RED._("diff.type.movedTo",{id:(localN.z||'global')});
+                        const movedToNodeTab = localDiff.newConfig.all[localN.z]
+                        const movedToLabel = `'${movedToNodeTab ? (movedToNodeTab.label || movedToNodeTab.id) : 'global'}'`
+                        localMovedMessage = RED._("diff.type.movedTo",{id:movedToLabel});
                     }
                     $('<span class="red-ui-diff-status"><i class="fa fa-caret-square-o-right"></i> '+localMovedMessage+'</span>').appendTo(localNodeDiv);
                 }
-                localChanged = true;
             } else if (localDiff.deleted[node.z]) {
                 localNodeDiv.addClass("red-ui-diff-empty");
-                localChanged = true;
             } else if (localDiff.deleted[node.id]) {
                 localNodeDiv.addClass("red-ui-diff-status-deleted");
                 $('<span class="red-ui-diff-status"><i class="fa fa-minus-square"></i> <span data-i18n="diff.type.deleted"></span></span>').appendTo(localNodeDiv);
-                localChanged = true;
             } else if (localDiff.changed[node.id]) {
                 if (localDiff.newConfig.all[node.id].z !== node.z) {
                     localNodeDiv.addClass("red-ui-diff-empty");
                 } else {
-                    localNodeDiv.addClass("red-ui-diff-status-changed");
-                    $('<span class="red-ui-diff-status"><i class="fa fa-square"></i> <span data-i18n="diff.type.changed"></span></span>').appendTo(localNodeDiv);
-                    localChanged = true;
+                    if (localDiff.positionChanged[node.id]) {
+                        localNodeDiv.addClass("red-ui-diff-status-moved");
+                        $('<span class="red-ui-diff-status"><i class="fa fa-square"></i> <span data-i18n="diff.type.moved"></span></span>').appendTo(localNodeDiv);
+                    } else {
+                        localNodeDiv.addClass("red-ui-diff-status-changed");
+                        $('<span class="red-ui-diff-status"><i class="fa fa-square"></i> <span data-i18n="diff.type.changed"></span></span>').appendTo(localNodeDiv);
+                    }
                 }
             } else {
                 if (localDiff.newConfig.all[node.id].z !== node.z) {
@@ -17109,9 +18266,13 @@ RED.diagnostics = (function () {
                         remoteNodeDiv.addClass("red-ui-diff-status-moved");
                         var remoteMovedMessage = "";
                         if (node.z === remoteN.z) {
-                            remoteMovedMessage = RED._("diff.type.movedFrom",{id:(remoteDiff.currentConfig.all[node.id].z||'global')});
+                            const movedFromNodeTab = remoteDiff.currentConfig.all[remoteDiff.currentConfig.all[node.id].z]
+                            const movedFromLabel = `'${movedFromNodeTab ? (movedFromNodeTab.label || movedFromNodeTab.id) : 'global'}'`
+                            remoteMovedMessage = RED._("diff.type.movedFrom",{id:movedFromLabel});
                         } else {
-                            remoteMovedMessage = RED._("diff.type.movedTo",{id:(remoteN.z||'global')});
+                            const movedToNodeTab = remoteDiff.newConfig.all[remoteN.z]
+                            const movedToLabel = `'${movedToNodeTab ? (movedToNodeTab.label || movedToNodeTab.id) : 'global'}'`
+                            remoteMovedMessage = RED._("diff.type.movedTo",{id:movedToLabel});
                         }
                         $('<span class="red-ui-diff-status"><i class="fa fa-caret-square-o-right"></i> '+remoteMovedMessage+'</span>').appendTo(remoteNodeDiv);
                     }
@@ -17124,8 +18285,13 @@ RED.diagnostics = (function () {
                     if (remoteDiff.newConfig.all[node.id].z !== node.z) {
                         remoteNodeDiv.addClass("red-ui-diff-empty");
                     } else {
-                        remoteNodeDiv.addClass("red-ui-diff-status-changed");
-                        $('<span class="red-ui-diff-status"><i class="fa fa-square"></i> <span data-i18n="diff.type.changed"></span></span>').appendTo(remoteNodeDiv);
+                        if (remoteDiff.positionChanged[node.id]) {
+                            remoteNodeDiv.addClass("red-ui-diff-status-moved");
+                            $('<span class="red-ui-diff-status"><i class="fa fa-square"></i> <span data-i18n="diff.type.moved"></span></span>').appendTo(remoteNodeDiv);
+                        } else {
+                            remoteNodeDiv.addClass("red-ui-diff-status-changed");
+                            $('<span class="red-ui-diff-status"><i class="fa fa-square"></i> <span data-i18n="diff.type.changed"></span></span>').appendTo(remoteNodeDiv);
+                        }
                     }
                 } else {
                     if (remoteDiff.newConfig.all[node.id].z !== node.z) {
@@ -17251,7 +18417,7 @@ RED.diagnostics = (function () {
             $("<td>",{class:"red-ui-diff-list-cell-label"}).text("position").appendTo(row);
             localCell = $("<td>",{class:"red-ui-diff-list-cell red-ui-diff-list-node-local"}).appendTo(row);
             if (localNode) {
-                localCell.addClass("red-ui-diff-status-"+(localChanged?"changed":"unchanged"));
+                localCell.addClass("red-ui-diff-status-"+(localChanged?"moved":"unchanged"));
                 $('<span class="red-ui-diff-status">'+(localChanged?'<i class="fa fa-square"></i>':'')+'</span>').appendTo(localCell);
                 element = $('<span class="red-ui-diff-list-element"></span>').appendTo(localCell);
                 var localPosition = {x:localNode.x,y:localNode.y};
@@ -17276,7 +18442,7 @@ RED.diagnostics = (function () {
 
             if (remoteNode !== undefined) {
                 remoteCell = $("<td>",{class:"red-ui-diff-list-cell red-ui-diff-list-node-remote"}).appendTo(row);
-                remoteCell.addClass("red-ui-diff-status-"+(remoteChanged?"changed":"unchanged"));
+                remoteCell.addClass("red-ui-diff-status-"+(remoteChanged?"moved":"unchanged"));
                 if (remoteNode) {
                     $('<span class="red-ui-diff-status">'+(remoteChanged?'<i class="fa fa-square"></i>':'')+'</span>').appendTo(remoteCell);
                     element = $('<span class="red-ui-diff-list-element"></span>').appendTo(remoteCell);
@@ -17562,11 +18728,11 @@ RED.diagnostics = (function () {
     //     var diff = generateDiff(originalFlow,nns);
     //     showDiff(diff);
     // }
-    function showRemoteDiff(diff) {
-        if (diff === undefined) {
-            getRemoteDiff(showRemoteDiff);
+    function showRemoteDiff(diff, options = {}) {
+        if (!diff) {
+            getRemoteDiff((remoteDiff) => showRemoteDiff(remoteDiff, options));
         } else {
-            showDiff(diff,{mode:'merge'});
+            showDiff(diff,{...options, mode:'merge'});
         }
     }
     function parseNodes(nodeList) {
@@ -17607,23 +18773,53 @@ RED.diagnostics = (function () {
         }
     }
     function generateDiff(currentNodes,newNodes) {
-        var currentConfig = parseNodes(currentNodes);
-        var newConfig = parseNodes(newNodes);
-        var added = {};
-        var deleted = {};
-        var changed = {};
-        var moved = {};
+        const currentConfig = parseNodes(currentNodes);
+        const newConfig = parseNodes(newNodes);
+        const added = {};
+        const deleted = {};
+        const changed = {};
+        const positionChanged = {};
+        const moved = {};
 
         Object.keys(currentConfig.all).forEach(function(id) {
-            var node = RED.nodes.workspace(id)||RED.nodes.subflow(id)||RED.nodes.node(id);
+            const node = RED.nodes.workspace(id)||RED.nodes.subflow(id)||RED.nodes.node(id);
             if (!newConfig.all.hasOwnProperty(id)) {
                 deleted[id] = true;
-            } else if (JSON.stringify(currentConfig.all[id]) !== JSON.stringify(newConfig.all[id])) {
+                return
+            }
+            const currentConfigJSON = JSON.stringify(currentConfig.all[id])
+            const newConfigJSON = JSON.stringify(newConfig.all[id])
+            
+            if (currentConfigJSON !== newConfigJSON) {
                 changed[id] = true;
-
                 if (currentConfig.all[id].z !== newConfig.all[id].z) {
                     moved[id] = true;
+                } else if (
+                    currentConfig.all[id].x !== newConfig.all[id].x ||
+                    currentConfig.all[id].y !== newConfig.all[id].y ||
+                    currentConfig.all[id].w !== newConfig.all[id].w ||
+                    currentConfig.all[id].h !== newConfig.all[id].h
+                ) {
+                    // This node's position on its parent has changed. We want to
+                    // check if this is the *only* change for this given node
+                    const currentNodeClone = JSON.parse(currentConfigJSON)
+                    const newNodeClone = JSON.parse(newConfigJSON)
+
+                    delete currentNodeClone.x
+                    delete currentNodeClone.y
+                    delete currentNodeClone.w
+                    delete currentNodeClone.h
+                    delete newNodeClone.x
+                    delete newNodeClone.y
+                    delete newNodeClone.w
+                    delete newNodeClone.h
+                    
+                    if (JSON.stringify(currentNodeClone) === JSON.stringify(newNodeClone)) {
+                        // Only the position has changed - everything else is the same
+                        positionChanged[id] = true
+                    }
                 }
+
             }
         });
         Object.keys(newConfig.all).forEach(function(id) {
@@ -17632,13 +18828,14 @@ RED.diagnostics = (function () {
             }
         });
 
-        var diff = {
-            currentConfig: currentConfig,
-            newConfig: newConfig,
-            added: added,
-            deleted: deleted,
-            changed: changed,
-            moved: moved
+        const diff = {
+            currentConfig,
+            newConfig,
+            added,
+            deleted,
+            changed,
+            positionChanged,
+            moved
         };
         return diff;
     }
@@ -17703,12 +18900,14 @@ RED.diagnostics = (function () {
         return diff;
     }
 
-    function showDiff(diff,options) {
+    function showDiff(diff, options) {
         if (diffVisible) {
             return;
         }
         options = options || {};
         var mode = options.mode || 'merge';
+        
+        options.hidePositionChanges = true
 
         var localDiff = diff.localDiff;
         var remoteDiff = diff.remoteDiff;
@@ -17778,6 +18977,9 @@ RED.diagnostics = (function () {
                         if (!$("#red-ui-diff-view-diff-merge").hasClass('disabled')) {
                             refreshConflictHeader(diff);
                             mergeDiff(diff);
+                            if (options.onmerge) {
+                                options.onmerge()
+                            }
                             RED.tray.close();
                         }
                     }
@@ -17808,6 +19010,7 @@ RED.diagnostics = (function () {
         var newConfig = [];
         var node;
         var nodeChangedStates = {};
+        var nodeMovedStates = {};
         var localChangedStates = {};
         for (id in localDiff.newConfig.all) {
             if (localDiff.newConfig.all.hasOwnProperty(id)) {
@@ -17815,12 +19018,14 @@ RED.diagnostics = (function () {
                 if (resolutions[id] === 'local') {
                     if (node) {
                         nodeChangedStates[id] = node.changed;
+                        nodeMovedStates[id] = node.moved;
                     }
                     newConfig.push(localDiff.newConfig.all[id]);
                 } else if (resolutions[id] === 'remote') {
                     if (!remoteDiff.deleted[id] && remoteDiff.newConfig.all.hasOwnProperty(id)) {
                         if (node) {
                             nodeChangedStates[id] = node.changed;
+                            nodeMovedStates[id] = node.moved;
                         }
                         localChangedStates[id] = 1;
                         newConfig.push(remoteDiff.newConfig.all[id]);
@@ -17844,8 +19049,9 @@ RED.diagnostics = (function () {
         }
         return {
             config: newConfig,
-            nodeChangedStates: nodeChangedStates,
-            localChangedStates: localChangedStates
+            nodeChangedStates,
+            nodeMovedStates,
+            localChangedStates
         }
     }
 
@@ -17856,6 +19062,7 @@ RED.diagnostics = (function () {
 
         var newConfig = appliedDiff.config;
         var nodeChangedStates = appliedDiff.nodeChangedStates;
+        var nodeMovedStates = appliedDiff.nodeMovedStates;
         var localChangedStates = appliedDiff.localChangedStates;
 
         var isDirty = RED.nodes.dirty();
@@ -17864,33 +19071,56 @@ RED.diagnostics = (function () {
             t:"replace",
             config: RED.nodes.createCompleteNodeSet(),
             changed: nodeChangedStates,
+            moved: nodeMovedStates,
+            complete: true,
             dirty: isDirty,
             rev: RED.nodes.version()
         }
 
         RED.history.push(historyEvent);
 
-        var originalFlow = RED.nodes.originalFlow();
-        // originalFlow is what the editor things it loaded
-        //  - add any newly added nodes from remote diff as they are now part of the record
-        for (var id in diff.remoteDiff.added) {
-            if (diff.remoteDiff.added.hasOwnProperty(id)) {
-                if (diff.remoteDiff.newConfig.all.hasOwnProperty(id)) {
-                    originalFlow.push(JSON.parse(JSON.stringify(diff.remoteDiff.newConfig.all[id])));
-                }
-            }
-        }
+        // var originalFlow = RED.nodes.originalFlow();
+        // // originalFlow is what the editor thinks it loaded
+        // //  - add any newly added nodes from remote diff as they are now part of the record
+        // for (var id in diff.remoteDiff.added) {
+        //     if (diff.remoteDiff.added.hasOwnProperty(id)) {
+        //         if (diff.remoteDiff.newConfig.all.hasOwnProperty(id)) {
+        //             originalFlow.push(JSON.parse(JSON.stringify(diff.remoteDiff.newConfig.all[id])));
+        //         }
+        //     }
+        // }
 
         RED.nodes.clear();
         var imported = RED.nodes.import(newConfig);
 
-        // Restore the original flow so subsequent merge resolutions can properly
-        // identify new-vs-old
-        RED.nodes.originalFlow(originalFlow);
+        // // Restore the original flow so subsequent merge resolutions can properly
+        // // identify new-vs-old
+        // RED.nodes.originalFlow(originalFlow);
+
+        // Clear all change flags from the import
+        RED.nodes.dirty(false);
+        
+        const flowsToLock = new Set()
+        function ensureUnlocked(id) {
+            const flow = id && (RED.nodes.workspace(id) || RED.nodes.subflow(id) || null);
+            const isLocked = flow ? flow.locked : false;
+            if (flow && isLocked) {
+                flow.locked = false;
+                flowsToLock.add(flow)
+            }
+        }
         imported.nodes.forEach(function(n) {
-            if (nodeChangedStates[n.id] || localChangedStates[n.id]) {
+            if (nodeChangedStates[n.id]) {
+                ensureUnlocked(n.z)
                 n.changed = true;
             }
+            if (nodeMovedStates[n.id]) {
+                ensureUnlocked(n.z)
+                n.moved = true;
+            }
+        })
+        flowsToLock.forEach(flow => {
+            flow.locked = true
         })
 
         RED.nodes.version(diff.remoteDiff.rev);
@@ -19559,10 +20789,6 @@ RED.keyboard = (function() {
     }
 
     function init(done) {
-        if (!RED.user.hasPermission("settings.write")) {
-            RED.notify(RED._("user.errors.settings"),"error");
-            return;
-        }
         RED.userSettings.add({
             id:'envvar',
             title: RED._("env-var.environment"),
@@ -19954,11 +21180,17 @@ RED.workspaces = (function() {
                 RED.sidebar.config.refresh();
                 RED.view.focus();
             },
-            onclick: function(tab) {
-                if (tab.id !== activeWorkspace) {
-                    addToViewStack(activeWorkspace);
+            onclick: function(tab, evt) {
+                if(evt.which === 2) {
+                    evt.preventDefault();
+                    evt.stopPropagation();
+                    RED.actions.invoke("core:hide-flow", tab)
+                } else {
+                    if (tab.id !== activeWorkspace) {
+                        addToViewStack(activeWorkspace);
+                    }
+                    RED.view.focus();
                 }
-                RED.view.focus();
             },
             ondblclick: function(tab) {
                 if (tab.type != "subflow") {
@@ -19996,6 +21228,7 @@ RED.workspaces = (function() {
                 if (tab.type === "tab") {
                     workspaceTabCount--;
                 } else {
+                    RED.events.emit("workspace:close",{workspace: tab.id})
                     hideStack.push(tab.id);
                 }
                 RED.menu.setDisabled("menu-item-workspace-delete",activeWorkspace === 0 || workspaceTabCount <= 1);
@@ -26831,6 +28064,10 @@ RED.view = (function() {
                             }
                         })
                     }
+                    if (selection.links) {
+                        selectedLinks.clear();
+                        selection.links.forEach(selectedLinks.add);
+                    }
                 }
             }
             updateSelection();
@@ -27034,14 +28271,27 @@ RED.view = (function() {
                     addAnnotation(evt.node.__pendingAnnotation__,evt);
                     delete evt.node.__pendingAnnotation__;
                 }
-                var badgeDX = 0;
-                var controlDX = 0;
-                for (var i=0,l=evt.el.__annotations__.length;i<l;i++) {
-                    var annotation = evt.el.__annotations__[i];
+                let badgeRDX = 0;
+                let badgeLDX = 0;
+                
+                for (let i=0,l=evt.el.__annotations__.length;i<l;i++) {
+                    const annotation = evt.el.__annotations__[i];
                     if (annotations.hasOwnProperty(annotation.id)) {
-                        var opts = annotations[annotation.id];
-                        var showAnnotation = true;
-                        var isBadge = opts.type === 'badge';
+                        const opts = annotations[annotation.id];
+                        let showAnnotation = true;
+                        const isBadge = opts.type === 'badge';
+                        if (opts.refresh !== undefined) {
+                            let refreshAnnotation = false
+                            if (typeof opts.refresh === "string") {
+                                refreshAnnotation = !!evt.node[opts.refresh]
+                                delete evt.node[opts.refresh]
+                            } else if (typeof opts.refresh === "function") {
+                                refreshAnnotation = opts.refresh(evnt.node)
+                            }
+                            if (refreshAnnotation) {
+                                refreshAnnotationElement(annotation.id, annotation.node, annotation.element)
+                            }
+                        }
                         if (opts.show !== undefined) {
                             if (typeof opts.show === "string") {
                                 showAnnotation = !!evt.node[opts.show]
@@ -27054,17 +28304,24 @@ RED.view = (function() {
                         }
                         if (isBadge) {
                             if (showAnnotation) {
-                                var rect = annotation.element.getBoundingClientRect();
-                                badgeDX += rect.width;
-                                annotation.element.setAttribute("transform", "translate("+(evt.node.w-3-badgeDX)+", -8)");
-                                badgeDX += 4;
+                                const rect = annotation.element.getBoundingClientRect();
+                                let annotationX
+                                if (!opts.align || opts.align === 'right') {
+                                    annotationX = evt.node.w - 3 - badgeRDX - rect.width
+                                    badgeRDX += rect.width + 4;
+
+                                } else if (opts.align === 'left') {
+                                    annotationX = 3 + badgeLDX
+                                    badgeLDX += rect.width + 4;
+                                }
+                                annotation.element.setAttribute("transform", "translate("+annotationX+", -8)");
                             }
-                        } else {
-                            if (showAnnotation) {
-                                var rect = annotation.element.getBoundingClientRect();
-                                annotation.element.setAttribute("transform", "translate("+(3+controlDX)+", -12)");
-                                controlDX += rect.width + 4;
-                            }
+                        // } else {
+                        //     if (showAnnotation) {
+                        //         var rect = annotation.element.getBoundingClientRect();
+                        //         annotation.element.setAttribute("transform", "translate("+(3+controlDX)+", -12)");
+                        //         controlDX += rect.width + 4;
+                        //     }
                         }
                     } else {
                         annotation.element.parentNode.removeChild(annotation.element);
@@ -27120,15 +28377,25 @@ RED.view = (function() {
         annotationGroup.setAttribute("class",opts.class || "");
         evt.el.__annotations__.push({
             id:id,
+            node: evt.node,
             element: annotationGroup
         });
-        var annotation = opts.element(evt.node);
+        refreshAnnotationElement(id, evt.node, annotationGroup)
+        evt.el.appendChild(annotationGroup);
+    }
+
+    function refreshAnnotationElement(id, node, annotationGroup) {
+        const opts = annotations[id];
+        const annotation = opts.element(node);
         if (opts.tooltip) {
-            annotation.addEventListener("mouseenter", getAnnotationMouseEnter(annotation,evt.node,opts.tooltip));
+            annotation.addEventListener("mouseenter", getAnnotationMouseEnter(annotation, node, opts.tooltip));
             annotation.addEventListener("mouseleave", annotationMouseLeave);
         }
+        if (annotationGroup.hasChildNodes()) {
+            annotationGroup.removeChild(annotationGroup.firstChild)
+        }
         annotationGroup.appendChild(annotation);
-        evt.el.appendChild(annotationGroup);
+
     }
 
 
@@ -29084,6 +30351,10 @@ RED.palette = (function() {
     var categoryContainers = {};
     var sidebarControls;
 
+    let paletteState = { filter: "", collapsed: [] };
+
+    let filterRefreshTimeout
+
     function createCategory(originalCategory,rootCategory,category,ns) {
         if ($("#red-ui-palette-base-category-"+rootCategory).length === 0) {
             createCategoryContainer(originalCategory,rootCategory, ns+":palette.label."+rootCategory);
@@ -29109,20 +30380,57 @@ RED.palette = (function() {
         catDiv.data('label',label);
         categoryContainers[category] = {
             container: catDiv,
-            close: function() {
+            hide: function (instant) {
+                if (instant) {
+                    catDiv.hide()
+                } else {
+                    catDiv.slideUp()
+                }
+            },
+            show: function () {
+                catDiv.show()
+            },
+            isOpen: function () {
+                return !!catDiv.hasClass("red-ui-palette-open")
+            },
+            getNodeCount: function (visibleOnly) {
+                const nodes = catDiv.find(".red-ui-palette-node")
+                if (visibleOnly) {
+                    return nodes.filter(function() { return $(this).css('display') !== 'none'}).length
+                } else {
+                    return nodes.length
+                }
+            },
+            close: function(instant, skipSaveState) {
                 catDiv.removeClass("red-ui-palette-open");
                 catDiv.addClass("red-ui-palette-closed");
-                $("#red-ui-palette-base-category-"+category).slideUp();
+                if (instant) {
+                    $("#red-ui-palette-base-category-"+category).hide();
+                } else {
+                    $("#red-ui-palette-base-category-"+category).slideUp();
+                }
                 $("#red-ui-palette-header-"+category+" i").removeClass("expanded");
+                if (!skipSaveState) {
+                    if (!paletteState.collapsed.includes(category)) {
+                        paletteState.collapsed.push(category);
+                        savePaletteState();
+                    }
+                }
             },
-            open: function() {
+            open: function(skipSaveState) {
                 catDiv.addClass("red-ui-palette-open");
                 catDiv.removeClass("red-ui-palette-closed");
                 $("#red-ui-palette-base-category-"+category).slideDown();
                 $("#red-ui-palette-header-"+category+" i").addClass("expanded");
+                if (!skipSaveState) {
+                    if (paletteState.collapsed.includes(category)) {
+                        paletteState.collapsed.splice(paletteState.collapsed.indexOf(category), 1);
+                        savePaletteState();
+                    }
+                }
             },
             toggle: function() {
-                if (catDiv.hasClass("red-ui-palette-open")) {
+                if (categoryContainers[category].isOpen()) {
                     categoryContainers[category].close();
                 } else {
                     categoryContainers[category].open();
@@ -29464,8 +30772,16 @@ RED.palette = (function() {
 
             var categoryNode = $("#red-ui-palette-container-"+rootCategory);
             if (categoryNode.find(".red-ui-palette-node").length === 1) {
-                categoryContainers[rootCategory].open();
+                if (!paletteState?.collapsed?.includes(rootCategory)) {
+                    categoryContainers[rootCategory].open();
+                } else {
+                    categoryContainers[rootCategory].close(true);
+                }
             }
+            clearTimeout(filterRefreshTimeout)
+            filterRefreshTimeout = setTimeout(() => {
+                refreshFilter()
+            }, 200)
 
         }
     }
@@ -29565,7 +30881,8 @@ RED.palette = (function() {
         paletteNode.css("backgroundColor", sf.color);
     }
 
-    function filterChange(val) {
+    function refreshFilter() {
+        const val = $("#red-ui-palette-search input").val()
         var re = new RegExp(val.replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&'),'i');
         $("#red-ui-palette-container .red-ui-palette-node").each(function(i,el) {
             var currentLabel = $(el).attr("data-palette-label");
@@ -29577,16 +30894,26 @@ RED.palette = (function() {
             }
         });
 
-        for (var category in categoryContainers) {
+        for (let category in categoryContainers) {
             if (categoryContainers.hasOwnProperty(category)) {
-                if (categoryContainers[category].container
-                        .find(".red-ui-palette-node")
-                        .filter(function() { return $(this).css('display') !== 'none'}).length === 0) {
-                    categoryContainers[category].close();
-                    categoryContainers[category].container.slideUp();
+                const categorySection = categoryContainers[category]
+                if (categorySection.getNodeCount(true) === 0) {
+                    categorySection.hide()
                 } else {
-                    categoryContainers[category].open();
-                    categoryContainers[category].container.show();
+                    categorySection.show()
+                    if (val) {
+                        // There is a filter being applied and it has matched
+                        // something in this category - show the contents
+                        categorySection.open(true)
+                    } else {
+                        // No filter. Only show the category if it isn't in lastState
+                        if (!paletteState.collapsed.includes(category)) {
+                            categorySection.open(true)
+                        } else if (categorySection.isOpen()) {
+                            // This section should be collapsed but isn't - so make it so
+                            categorySection.close(true, true)
+                        }
+                    }
                 }
             }
         }
@@ -29602,6 +30929,9 @@ RED.palette = (function() {
 
         $("#red-ui-palette > .red-ui-palette-spinner").show();
 
+        RED.events.on('logout', function () {
+            RED.settings.removeLocal('palette-state')
+        })
 
         RED.events.on('registry:node-type-added', function(nodeType) {
             var def = RED.nodes.getType(nodeType);
@@ -29645,14 +30975,14 @@ RED.palette = (function() {
 
         RED.events.on("subflows:change",refreshSubflow);
 
-
-
         $("#red-ui-palette-search input").searchBox({
             delay: 100,
             change: function() {
-                filterChange($(this).val());
+                refreshFilter();
+                paletteState.filter = $(this).val();
+                savePaletteState();
             }
-        })
+        });
 
         sidebarControls = $('<div class="red-ui-sidebar-control-left"><i class="fa fa-chevron-left"></i></div>').appendTo($("#red-ui-palette"));
         RED.popover.tooltip(sidebarControls,RED._("keyboard.togglePalette"),"core:toggle-palette");
@@ -29718,7 +31048,23 @@ RED.palette = (function() {
                 togglePalette(state);
             }
         });
+
+        try {
+            paletteState = JSON.parse(RED.settings.getLocal("palette-state") || '{"filter":"", "collapsed": []}');
+            if (paletteState.filter) {
+                // Apply the category filter
+                $("#red-ui-palette-search input").searchBox("value", paletteState.filter);
+            }
+        } catch (error) {
+            console.error("Unexpected error loading palette state from localStorage: ", error);
+        }
+        setTimeout(() => {
+            // Lazily tidy up any categories that haven't been reloaded
+            paletteState.collapsed = paletteState.collapsed.filter(category => !!categoryContainers[category])
+            savePaletteState()
+        }, 10000)
     }
+
     function togglePalette(state) {
         if (!state) {
             $("#red-ui-main-container").addClass("red-ui-palette-closed");
@@ -29738,6 +31084,15 @@ RED.palette = (function() {
         })
         return categories;
     }
+
+    function savePaletteState() {
+        try {
+            RED.settings.setLocal("palette-state", JSON.stringify(paletteState));
+        } catch (error) {
+            console.error("Unexpected error saving palette state to localStorage: ", error);
+        }
+    }
+
     return {
         init: init,
         add:addNodeType,
@@ -30461,7 +31816,7 @@ RED.sidebar.info = (function() {
                 evt.stopPropagation();
                 RED.search.show("type:subflow:"+n.id);
             })
-            // RED.popover.tooltip(userCountBadge,function() { return RED._('editor.nodesUse',{count:n.users.length})});
+            RED.popover.tooltip(subflowInstanceBadge,function() { return RED._('subflow.subflowInstances',{count:n.instances.length})});
         }
         if (n._def.category === "config" && n.type !== "group") {
             var userCountBadge = $('<button type="button" class="red-ui-info-outline-item-control-users red-ui-button red-ui-button-small"><i class="fa fa-toggle-right"></i></button>').text(n.users.length).appendTo(controls).on("click",function(evt) {
@@ -32490,7 +33845,7 @@ RED.palette.editor = (function() {
         }).done(function(data,textStatus,xhr) {
             callback();
         }).fail(function(xhr,textStatus,err) {
-            callback(xhr);
+            callback(xhr,textStatus,err);
         });
     }
     function removeNodeModule(id,callback) {
@@ -32605,86 +33960,106 @@ RED.palette.editor = (function() {
             var moduleInfo = nodeEntries[module].info;
             var nodeEntry = nodeEntries[module].elements;
             if (nodeEntry) {
-                var activeTypeCount = 0;
-                var typeCount = 0;
-                var errorCount = 0;
-                nodeEntry.errorList.empty();
-                nodeEntries[module].totalUseCount = 0;
-                nodeEntries[module].setUseCount = {};
+                if (moduleInfo.plugin) {
+                    nodeEntry.enableButton.hide();
+                    nodeEntry.removeButton.show();
 
-                for (var setName in moduleInfo.sets) {
-                    if (moduleInfo.sets.hasOwnProperty(setName)) {
-                        var inUseCount = 0;
-                        var set = moduleInfo.sets[setName];
-                        var setElements = nodeEntry.sets[setName];
-                        if (set.err) {
-                            errorCount++;
-                            var errMessage = set.err;
-                            if (set.err.message) {
-                                errMessage = set.err.message;
-                            } else if (set.err.code) {
-                                errMessage = set.err.code;
+                    let pluginCount = 0;
+                    for (let setName in moduleInfo.sets) {
+                        if (moduleInfo.sets.hasOwnProperty(setName)) {
+                            let set = moduleInfo.sets[setName];
+                            if (set.plugins) {
+                                pluginCount += set.plugins.length;
                             }
-                            $("<li>").text(errMessage).appendTo(nodeEntry.errorList);
                         }
-                        if (set.enabled) {
-                            activeTypeCount += set.types.length;
-                        }
-                        typeCount += set.types.length;
-                        for (var i=0;i<moduleInfo.sets[setName].types.length;i++) {
-                            var t = moduleInfo.sets[setName].types[i];
-                            inUseCount += (typesInUse[t]||0);
-                            var swatch = setElements.swatches[t];
+                    }
+                    
+                    nodeEntry.setCount.text(RED._('palette.editor.pluginCount',{count:pluginCount,label:pluginCount}));
+
+                } else {
+                    var activeTypeCount = 0;
+                    var typeCount = 0;
+                    var errorCount = 0;
+                    nodeEntry.errorList.empty();
+                    nodeEntries[module].totalUseCount = 0;
+                    nodeEntries[module].setUseCount = {};
+
+                    for (var setName in moduleInfo.sets) {
+                        if (moduleInfo.sets.hasOwnProperty(setName)) {
+                            var inUseCount = 0;
+                            const set = moduleInfo.sets[setName];
+                            const setElements = nodeEntry.sets[setName]
+
+                            if (set.err) {
+                                errorCount++;
+                                var errMessage = set.err;
+                                if (set.err.message) {
+                                    errMessage = set.err.message;
+                                } else if (set.err.code) {
+                                    errMessage = set.err.code;
+                                }
+                                $("<li>").text(errMessage).appendTo(nodeEntry.errorList);
+                            }
                             if (set.enabled) {
-                                var def = RED.nodes.getType(t);
-                                if (def && def.color) {
-                                    swatch.css({background:RED.utils.getNodeColor(t,def)});
-                                    swatch.css({border: "1px solid "+getContrastingBorder(swatch.css('backgroundColor'))})
+                                activeTypeCount += set.types.length;
+                            }
+                            typeCount += set.types.length;
+                            for (var i=0;i<moduleInfo.sets[setName].types.length;i++) {
+                                var t = moduleInfo.sets[setName].types[i];
+                                inUseCount += (typesInUse[t]||0);
+                                if (setElements && set.enabled) {
+                                    var def = RED.nodes.getType(t);
+                                    if (def && def.color) {
+                                        setElements.swatches[t].css({background:RED.utils.getNodeColor(t,def)});
+                                        setElements.swatches[t].css({border: "1px solid "+getContrastingBorder(setElements.swatches[t].css('backgroundColor'))})
+                                    }
                                 }
                             }
-                        }
-                        nodeEntries[module].setUseCount[setName] = inUseCount;
-                        nodeEntries[module].totalUseCount += inUseCount;
+                            nodeEntries[module].setUseCount[setName] = inUseCount;
+                            nodeEntries[module].totalUseCount += inUseCount;
 
-                        if (inUseCount > 0) {
-                            setElements.enableButton.text(RED._('palette.editor.inuse'));
-                            setElements.enableButton.addClass('disabled');
-                        } else {
-                            setElements.enableButton.removeClass('disabled');
-                            if (set.enabled) {
-                                setElements.enableButton.text(RED._('palette.editor.disable'));
-                            } else {
-                                setElements.enableButton.text(RED._('palette.editor.enable'));
+                            if (setElements) {
+                                if (inUseCount > 0) {
+                                    setElements.enableButton.text(RED._('palette.editor.inuse'));
+                                    setElements.enableButton.addClass('disabled');
+                                } else {
+                                    setElements.enableButton.removeClass('disabled');
+                                    if (set.enabled) {
+                                        setElements.enableButton.text(RED._('palette.editor.disable'));
+                                    } else {
+                                        setElements.enableButton.text(RED._('palette.editor.enable'));
+                                    }
+                                }
+                                setElements.setRow.toggleClass("red-ui-palette-module-set-disabled",!set.enabled);
                             }
                         }
-                        setElements.setRow.toggleClass("red-ui-palette-module-set-disabled",!set.enabled);
                     }
-                }
 
-                if (errorCount === 0) {
-                    nodeEntry.errorRow.hide()
-                } else {
-                    nodeEntry.errorRow.show();
-                }
-
-                var nodeCount = (activeTypeCount === typeCount)?typeCount:activeTypeCount+" / "+typeCount;
-                nodeEntry.setCount.text(RED._('palette.editor.nodeCount',{count:typeCount,label:nodeCount}));
-
-                if (nodeEntries[module].totalUseCount > 0) {
-                    nodeEntry.enableButton.text(RED._('palette.editor.inuse'));
-                    nodeEntry.enableButton.addClass('disabled');
-                    nodeEntry.removeButton.hide();
-                } else {
-                    nodeEntry.enableButton.removeClass('disabled');
-                    if (moduleInfo.local) {
-                        nodeEntry.removeButton.css('display', 'inline-block');
-                    }
-                    if (activeTypeCount === 0) {
-                        nodeEntry.enableButton.text(RED._('palette.editor.enableall'));
+                    if (errorCount === 0) {
+                        nodeEntry.errorRow.hide()
                     } else {
-                        nodeEntry.enableButton.text(RED._('palette.editor.disableall'));
+                        nodeEntry.errorRow.show();
                     }
-                    nodeEntry.container.toggleClass("disabled",(activeTypeCount === 0));
+
+                    var nodeCount = (activeTypeCount === typeCount)?typeCount:activeTypeCount+" / "+typeCount;
+                    nodeEntry.setCount.text(RED._('palette.editor.nodeCount',{count:typeCount,label:nodeCount}));
+
+                    if (nodeEntries[module].totalUseCount > 0) {
+                        nodeEntry.enableButton.text(RED._('palette.editor.inuse'));
+                        nodeEntry.enableButton.addClass('disabled');
+                        nodeEntry.removeButton.hide();
+                    } else {
+                        nodeEntry.enableButton.removeClass('disabled');
+                        if (moduleInfo.local) {
+                            nodeEntry.removeButton.css('display', 'inline-block');
+                        }
+                        if (activeTypeCount === 0) {
+                            nodeEntry.enableButton.text(RED._('palette.editor.enableall'));
+                        } else {
+                            nodeEntry.enableButton.text(RED._('palette.editor.disableall'));
+                        }
+                        nodeEntry.container.toggleClass("disabled",(activeTypeCount === 0));
+                    }
                 }
             }
             if (moduleInfo.pending_version) {
@@ -33035,6 +34410,33 @@ RED.palette.editor = (function() {
                 }
             }
         })
+
+        RED.events.on("registry:plugin-module-added", function(module) {
+
+            if (!nodeEntries.hasOwnProperty(module)) {
+                nodeEntries[module] = {info:RED.plugins.getModule(module)};
+                var index = [module];
+                for (var s in nodeEntries[module].info.sets) {
+                    if (nodeEntries[module].info.sets.hasOwnProperty(s)) {
+                        index.push(s);
+                        index = index.concat(nodeEntries[module].info.sets[s].types)
+                    }
+                }
+                nodeEntries[module].index = index.join(",").toLowerCase();
+                nodeList.editableList('addItem', nodeEntries[module]);
+            } else {
+                _refreshNodeModule(module);
+            }
+
+            for (var i=0;i<filteredList.length;i++) {
+                if (filteredList[i].info.id === module) {
+                    var installButton = filteredList[i].elements.installButton;
+                    installButton.addClass('disabled');
+                    installButton.text(RED._('palette.editor.installed'));
+                    break;
+                }
+            }
+        });
     }
 
     var settingsPane;
@@ -33161,6 +34563,7 @@ RED.palette.editor = (function() {
                         errorRow: errorRow,
                         errorList: errorList,
                         setCount: setCount,
+                        setButton: setButton,
                         container: container,
                         shade: shade,
                         versionSpan: versionSpan,
@@ -33171,49 +34574,88 @@ RED.palette.editor = (function() {
                         if (container.hasClass('expanded')) {
                             container.removeClass('expanded');
                             contentRow.slideUp();
+                            setTimeout(() => {
+                                contentRow.empty()
+                            }, 200)
+                            object.elements.sets = {}
                         } else {
                             container.addClass('expanded');
+                            populateSetList()
                             contentRow.slideDown();
                         }
                     })
-
-                    var setList = Object.keys(entry.sets)
-                    setList.sort(function(A,B) {
-                        return A.toLowerCase().localeCompare(B.toLowerCase());
-                    });
-                    setList.forEach(function(setName) {
-                        var set = entry.sets[setName];
-                        var setRow = $('<div>',{class:"red-ui-palette-module-set"}).appendTo(contentRow);
-                        var buttonGroup = $('<div>',{class:"red-ui-palette-module-set-button-group"}).appendTo(setRow);
-                        var typeSwatches = {};
-                        set.types.forEach(function(t) {
-                            var typeDiv = $('<div>',{class:"red-ui-palette-module-type"}).appendTo(setRow);
-                            typeSwatches[t] = $('<span>',{class:"red-ui-palette-module-type-swatch"}).appendTo(typeDiv);
-                            $('<span>',{class:"red-ui-palette-module-type-node"}).text(t).appendTo(typeDiv);
-                        })
-                        var enableButton = $('<a href="#" class="red-ui-button red-ui-button-small"></a>').appendTo(buttonGroup);
-                        enableButton.on("click", function(evt) {
-                            evt.preventDefault();
-                            if (object.setUseCount[setName] === 0) {
-                                var currentSet = RED.nodes.registry.getNodeSet(set.id);
-                                shade.show();
-                                var newState = !currentSet.enabled
-                                changeNodeState(set.id,newState,shade,function(xhr){
-                                    if (xhr) {
-                                        if (xhr.responseJSON) {
-                                            RED.notify(RED._('palette.editor.errors.'+(newState?'enable':'disable')+'Failed',{module: id,message:xhr.responseJSON.message}));
+                    const populateSetList = function () {
+                        var setList = Object.keys(entry.sets)
+                        setList.sort(function(A,B) {
+                            return A.toLowerCase().localeCompare(B.toLowerCase());
+                        });
+                        setList.forEach(function(setName) {
+                            var set = entry.sets[setName];
+                            var setRow = $('<div>',{class:"red-ui-palette-module-set"}).appendTo(contentRow);
+                            var buttonGroup = $('<div>',{class:"red-ui-palette-module-set-button-group"}).appendTo(setRow);
+                            var typeSwatches = {};
+                            let enableButton;
+                            if (set.types) {
+                                set.types.forEach(function(t) {
+                                    var typeDiv = $('<div>',{class:"red-ui-palette-module-type"}).appendTo(setRow);
+                                    typeSwatches[t] = $('<span>',{class:"red-ui-palette-module-type-swatch"}).appendTo(typeDiv);
+                                    if (set.enabled) {
+                                        var def = RED.nodes.getType(t);
+                                        if (def && def.color) {
+                                            typeSwatches[t].css({background:RED.utils.getNodeColor(t,def)});
+                                            typeSwatches[t].css({border: "1px solid "+getContrastingBorder(typeSwatches[t].css('backgroundColor'))})
                                         }
                                     }
-                                });
-                            }
-                        })
+                                    $('<span>',{class:"red-ui-palette-module-type-node"}).text(t).appendTo(typeDiv);
+                                })
+                                enableButton = $('<a href="#" class="red-ui-button red-ui-button-small"></a>').appendTo(buttonGroup);
+                                enableButton.on("click", function(evt) {
+                                    evt.preventDefault();
+                                    if (object.setUseCount[setName] === 0) {
+                                        var currentSet = RED.nodes.registry.getNodeSet(set.id);
+                                        shade.show();
+                                        var newState = !currentSet.enabled
+                                        changeNodeState(set.id,newState,shade,function(xhr){
+                                            if (xhr) {
+                                                if (xhr.responseJSON) {
+                                                    RED.notify(RED._('palette.editor.errors.'+(newState?'enable':'disable')+'Failed',{module: id,message:xhr.responseJSON.message}));
+                                                }
+                                            }
+                                        });
+                                    }
+                                })
 
-                        object.elements.sets[set.name] = {
-                            setRow: setRow,
-                            enableButton: enableButton,
-                            swatches: typeSwatches
-                        };
-                    });
+                                if (object.setUseCount[setName] > 0) {
+                                    enableButton.text(RED._('palette.editor.inuse'));
+                                    enableButton.addClass('disabled');
+                                } else {
+                                    enableButton.removeClass('disabled');
+                                    if (set.enabled) {
+                                        enableButton.text(RED._('palette.editor.disable'));
+                                    } else {
+                                        enableButton.text(RED._('palette.editor.enable'));
+                                    }
+                                }
+                                setRow.toggleClass("red-ui-palette-module-set-disabled",!set.enabled);
+
+
+                            }
+                            if (set.plugins) {
+                                set.plugins.forEach(function(p) {
+                                    var typeDiv = $('<div>',{class:"red-ui-palette-module-type"}).appendTo(setRow);
+                                    // typeSwatches[p.id] = $('<span>',{class:"red-ui-palette-module-type-swatch"}).appendTo(typeDiv);
+                                    $('<span><i class="fa fa-puzzle-piece" aria-hidden="true"></i>  </span>',{class:"red-ui-palette-module-type-swatch"}).appendTo(typeDiv);
+                                    $('<span>',{class:"red-ui-palette-module-type-node"}).text(p.id).appendTo(typeDiv);
+                                })
+                            }
+
+                            object.elements.sets[set.name] = {
+                                setRow: setRow,
+                                enableButton: enableButton,
+                                swatches: typeSwatches
+                            };
+                        });
+                    }
                     enableButton.on("click", function(evt) {
                         evt.preventDefault();
                         if (object.totalUseCount === 0) {
@@ -33583,7 +35025,55 @@ RED.palette.editor = (function() {
                                                 }
                                             }
                                         ]
-                                    });                                }
+                                    });                                
+                                }
+                            } else {
+                                // dedicated list management for plugins
+                                if (entry.plugin) {
+
+                                    let e = nodeEntries[entry.name];
+                                    if (e) {
+                                        nodeList.editableList('removeItem', e);
+                                        delete nodeEntries[entry.name];
+                                    }
+
+                                    // We assume that a plugin that implements onremove
+                                    // cleans the editor accordingly of its left-overs.
+                                    let found_onremove = true;
+
+                                    let keys = Object.keys(entry.sets);
+                                    keys.forEach((key) => {
+                                        let set = entry.sets[key];
+                                        for (let i=0; i<set.plugins?.length; i++) {
+                                            let plgn = RED.plugins.getPlugin(set.plugins[i].id);
+                                            if (plgn && plgn.onremove  && typeof plgn.onremove === 'function') {
+                                                plgn.onremove();
+                                            } else {
+                                                if (plgn && plgn.onadd && typeof plgn.onadd === 'function') {
+                                                    // if there's no 'onadd', there shouldn't be any left-overs
+                                                    found_onremove = false;
+                                                }
+                                            }
+                                        }
+                                    });
+
+                                    if (!found_onremove) {
+                                        let removeNotify = RED.notify(RED._("palette.editor.confirm.removePlugin.body",{module:entry.name}),{
+                                            modal: true,
+                                            fixed: true,
+                                            type: 'warning',
+                                            buttons: [
+                                                {
+                                                    text: RED._("palette.editor.confirm.button.understood"),
+                                                    class:"primary",
+                                                    click: function(e) {
+                                                        removeNotify.close();
+                                                    }
+                                                }
+                                            ]
+                                        });
+                                    }
+                                }        
                             }
                         })
                         notification.close();
@@ -33627,9 +35117,28 @@ RED.palette.editor = (function() {
                     RED.actions.invoke("core:show-event-log");
                 });
                 RED.eventLog.startEvent(RED._("palette.editor.confirm.button.install")+" : "+entry.id+" "+entry.version);
-                installNodeModule(entry.id,entry.version,entry.pkg_url,function(xhr) {
+                installNodeModule(entry.id,entry.version,entry.pkg_url,function(xhr, textStatus,err) {
                     spinner.remove();
-                     if (xhr) {
+                     if (err && xhr.status === 504) {
+                        var notification = RED.notify(RED._("palette.editor.errors.installTimeout"), {
+                            modal: true,
+                            fixed: true,
+                            buttons: [
+                                {
+                                    text: RED._("common.label.close"),
+                                    click: function() {
+                                        notification.close();
+                                    }
+                                },{
+                                    text: RED._("eventLog.view"),
+                                    click: function() {
+                                        notification.close();
+                                        RED.actions.invoke("core:show-event-log");
+                                    }
+                                }
+                            ]
+                        })
+                     } else if (xhr) {
                          if (xhr.responseJSON) {
                              var notification = RED.notify(RED._('palette.editor.errors.installFailed',{module: entry.id,message:xhr.responseJSON.message}),{
                                  type: 'error',
@@ -33829,6 +35338,12 @@ RED.editor = (function() {
             }
         }
         if (valid && "validate" in definition[property]) {
+            if (definition[property].hasOwnProperty("required") &&
+                definition[property].required === false) {
+                if (value === "") {
+                    return true;
+                }
+            }
             try {
                 var opt = {};
                 if (label) {
@@ -33855,6 +35370,11 @@ RED.editor = (function() {
                 });
             }
         } else if (valid) {
+            if (definition[property].hasOwnProperty("required") && definition[property].required === false) {
+                if (value === "") {
+                    return true;
+                }
+            }
             // If the validator is not provided in node property => Check if the input has a validator
             if ("category" in node._def) {
                 const isConfig = node._def.category === "config";
@@ -33862,7 +35382,10 @@ RED.editor = (function() {
                 const input = $("#"+prefix+"-"+property);
                 const isTypedInput = input.length > 0 && input.next(".red-ui-typedInput-container").length > 0;
                 if (isTypedInput) {
-                    valid = input.typedInput("validate");
+                    valid = input.typedInput("validate", { returnErrorMessage: true });
+                    if (typeof valid === "string") {
+                        return label ? label + ": " + valid : valid;
+                    }
                 }
             }
         }
@@ -34000,49 +35523,101 @@ RED.editor = (function() {
 
     /**
      * Create a config-node select box for this property
-     * @param node - the node being edited
-     * @param property - the name of the field
-     * @param type - the type of the config-node
+     * @param  {Object} node - the node being edited
+     * @param {String} property - the name of the node property
+     * @param {String} type - the type of the config-node
+     * @param {"node-config-input"|"node-input"|"node-input-subflow-env"} prefix - the prefix to use in the input element ids
+     * @param {Function} [filter] - a function to filter the list of config nodes
+     * @param {Object} [env] - the environment variable object (only used for subflow env vars)
      */
-    function prepareConfigNodeSelect(node,property,type,prefix,filter) {
-        var input = $("#"+prefix+"-"+property);
-        if (input.length === 0 ) {
+    function prepareConfigNodeSelect(node, property, type, prefix, filter, env) {
+        let nodeValue
+        if (prefix === 'node-input-subflow-env') {
+            nodeValue = env?.value
+        } else {
+            nodeValue = node[property]
+        }
+
+        const addBtnId = `${prefix}-btn-${property}-add`;
+        const editBtnId = `${prefix}-btn-${property}-edit`;
+        const selectId = prefix + '-' + property;
+        const input = $(`#${selectId}`);
+        if (input.length === 0) {
             return;
         }
-        var newWidth = input.width();
-        var attrStyle = input.attr('style');
-        var m;
+        const attrStyle = input.attr('style');
+        let newWidth;
+        let m;
         if ((m = /(^|\s|;)width\s*:\s*([^;]+)/i.exec(attrStyle)) !== null) {
             newWidth = m[2].trim();
         } else {
             newWidth = "70%";
         }
-        var outerWrap = $("<div></div>").css({
+        const outerWrap = $("<div></div>").css({
             width: newWidth,
-            display:'inline-flex'
+            display: 'inline-flex'
         });
-        var select = $('<select id="'+prefix+'-'+property+'"></select>').appendTo(outerWrap);
+        const select = $('<select id="' + selectId + '"></select>').appendTo(outerWrap);
         input.replaceWith(outerWrap);
         // set the style attr directly - using width() on FF causes a value of 114%...
         select.css({
             'flex-grow': 1
         });
-        updateConfigNodeSelect(property,type,node[property],prefix,filter);
-        $('<a id="'+prefix+'-lookup-'+property+'" class="red-ui-button"><i class="fa fa-pencil"></i></a>')
-            .css({"margin-left":"10px"})
+
+        updateConfigNodeSelect(property, type, nodeValue, prefix, filter);
+
+        // create the edit button
+        const editButton = $('<a id="' + editBtnId + '" class="red-ui-button"><i class="fa fa-pencil"></i></a>')
+            .css({ "margin-left": "10px" })
             .appendTo(outerWrap);
-        $('#'+prefix+'-lookup-'+property).on("click", function(e) {
-            showEditConfigNodeDialog(property,type,select.find(":selected").val(),prefix,node);
+
+        RED.popover.tooltip(editButton, RED._('editor.editConfig', { type }));
+
+        // create the add button
+        const addButton = $('<a id="' + addBtnId + '" class="red-ui-button"><i class="fa fa-plus"></i></a>')
+            .css({ "margin-left": "10px" })
+            .appendTo(outerWrap);
+        RED.popover.tooltip(addButton, RED._('editor.addNewConfig', { type }));
+
+        const disableButton = function(button, disabled) {
+            $(button).prop("disabled", !!disabled)
+            $(button).toggleClass("disabled", !!disabled)
+        };
+
+        // add the click handler
+        addButton.on("click", function (e) {
+            if (addButton.prop("disabled")) { return }
+            showEditConfigNodeDialog(property, type, "_ADD_", prefix, node);
             e.preventDefault();
         });
-        var label = "";
-        var configNode = RED.nodes.node(node[property]);
-        var node_def = RED.nodes.getType(type);
+        editButton.on("click", function (e) {
+            const selectedOpt = select.find(":selected")
+            if (selectedOpt.data('env')) { return } // don't show the dialog for env vars items (MVP. Future enhancement: lookup the env, if present, show the associated edit dialog)
+            if (editButton.prop("disabled")) { return }
+            showEditConfigNodeDialog(property, type, selectedOpt.val(), prefix, node);
+            e.preventDefault();
+        });
 
-        if (configNode) {
-            label = RED.utils.getNodeLabel(configNode,configNode.id);
-        }
-        input.val(label);
+        // dont permit the user to click the button if the selected option is an env var
+        select.on("change", function () {
+            const selectedOpt = select.find(":selected");
+            const optionsLength = select.find("option").length;
+            if (selectedOpt?.data('env')) {
+                disableButton(addButton, true);
+                disableButton(editButton, true);
+            // disable the edit button if no options available or 'none' selected
+            } else if (optionsLength === 1 || selectedOpt.val() === "_ADD_") {
+                disableButton(addButton, false);
+                disableButton(editButton, true);
+            } else {
+                disableButton(addButton, false);
+                disableButton(editButton, false);
+            }
+        });
+
+        // If the value is "", 'add new...' option if no config node available or 'none' option
+        // Otherwise, it's a config node
+        select.val(nodeValue || '_ADD_');
     }
 
     /**
@@ -34449,12 +36024,9 @@ RED.editor = (function() {
     }
 
     function defaultConfigNodeSort(A,B) {
-        if (A.__label__ < B.__label__) {
-            return -1;
-        } else if (A.__label__ > B.__label__) {
-            return 1;
-        }
-        return 0;
+        // sort case insensitive so that `[env] node-name` items are at the top and
+        // not mixed inbetween the the lower and upper case items
+        return (A.__label__ || '').localeCompare((B.__label__ || ''), undefined, {sensitivity: 'base'})
     }
 
     function updateConfigNodeSelect(name,type,value,prefix,filter) {
@@ -34469,7 +36041,7 @@ RED.editor = (function() {
                 }
                 $("#"+prefix+"-"+name).val(value);
             } else {
-
+                let inclSubflowEnvvars = false
                 var select = $("#"+prefix+"-"+name);
                 var node_def = RED.nodes.getType(type);
                 select.children().remove();
@@ -34477,6 +36049,7 @@ RED.editor = (function() {
                 var activeWorkspace = RED.nodes.workspace(RED.workspaces.active());
                 if (!activeWorkspace) {
                     activeWorkspace = RED.nodes.subflow(RED.workspaces.active());
+                    inclSubflowEnvvars = true
                 }
 
                 var configNodes = [];
@@ -34492,6 +36065,31 @@ RED.editor = (function() {
                         }
                     }
                 });
+ 
+                // as includeSubflowEnvvars is true, this is a subflow.
+                // include any 'conf-types' env vars as a list of avaiable configs
+                // in the config dropdown as `[env] node-name`
+                if (inclSubflowEnvvars && activeWorkspace.env) {
+                    const parentEnv = activeWorkspace.env.filter(env => env.ui?.type === 'conf-types' && env.type === type)
+                    if (parentEnv && parentEnv.length > 0) {
+                        const locale = RED.i18n.lang()
+                        for (let i = 0; i < parentEnv.length; i++) {
+                            const tenv = parentEnv[i]
+                            const ui = tenv.ui || {}
+                            const labels = ui.label || {}
+                            const labelText = RED.editor.envVarList.lookupLabel(labels, labels["en-US"] || tenv.name, locale)
+                            const config = {
+                                env: tenv,
+                                id: '${' + parentEnv[0].name + '}',
+                                type: type,
+                                label: labelText,
+                                __label__: `[env] ${labelText}`
+                            }
+                            configNodes.push(config)
+                        }
+                    }
+                }
+
                 var configSortFn = defaultConfigNodeSort;
                 if (typeof node_def.sort == "function") {
                     configSortFn = node_def.sort;
@@ -34503,7 +36101,10 @@ RED.editor = (function() {
                 }
 
                 configNodes.forEach(function(cn) {
-                    $('<option value="'+cn.id+'"'+(value==cn.id?" selected":"")+'></option>').text(RED.text.bidi.enforceTextDirectionWithUCC(cn.__label__)).appendTo(select);
+                    const option = $('<option value="'+cn.id+'"'+(value==cn.id?" selected":"")+'></option>').text(RED.text.bidi.enforceTextDirectionWithUCC(cn.__label__)).appendTo(select);
+                    if (cn.env) {
+                        option.data('env', cn.env) // set a data attribute to indicate this is an env var (to inhibit the edit button)
+                    }
                     delete cn.__label__;
                 });
 
@@ -34516,7 +36117,14 @@ RED.editor = (function() {
                     }
                 }
 
-                select.append('<option value="_ADD_"'+(value===""?" selected":"")+'>'+RED._("editor.addNewType", {type:label})+'</option>');
+                if (!configNodes.length) {
+                    // Add 'add new...' option
+                    select.append('<option value="_ADD_" selected>' + RED._("editor.addNewType", { type: label }) + '</option>');
+                } else {
+                    // Add 'none' option
+                    select.append('<option value="_ADD_">' + RED._("editor.inputs.none") + '</option>');
+                }
+
                 window.setTimeout(function() { select.trigger("change");},50);
             }
         }
@@ -35184,9 +36792,16 @@ RED.editor = (function() {
                     }
                     RED.tray.close(function() {
                         var filter = null;
-                        if (editContext && typeof editContext._def.defaults[configProperty].filter === 'function') {
-                            filter = function(n) {
-                                return editContext._def.defaults[configProperty].filter.call(editContext,n);
+                        // when editing a config via subflow edit panel, the `configProperty` will not
+                        // necessarily be a property of the editContext._def.defaults object
+                        // Also, when editing via dashboard sidebar, editContext can be null
+                        // so we need to guard both scenarios
+                        if (editContext?._def) {
+                            const isSubflow = (editContext._def.type === 'subflow' || /subflow:.*/.test(editContext._def.type))
+                            if (editContext && !isSubflow && typeof editContext._def.defaults?.[configProperty]?.filter === 'function') {
+                                filter = function(n) {
+                                    return editContext._def.defaults[configProperty].filter.call(editContext,n);
+                                }
                             }
                         }
                         updateConfigNodeSelect(configProperty,configType,editing_config_node.id,prefix,filter);
@@ -35247,7 +36862,7 @@ RED.editor = (function() {
                     RED.history.push(historyEvent);
                     RED.tray.close(function() {
                         var filter = null;
-                        if (editContext && typeof editContext._def.defaults[configProperty].filter === 'function') {
+                        if (editContext && typeof editContext._def.defaults[configProperty]?.filter === 'function') {
                             filter = function(n) {
                                 return editContext._def.defaults[configProperty].filter.call(editContext,n);
                             }
@@ -35788,6 +37403,7 @@ RED.editor = (function() {
             }
         },
         editBuffer: function(options) { showTypeEditor("_buffer", options) },
+        getEditStack: function () { return [...editStack] },
         buildEditForm: buildEditForm,
         validateNode: validateNode,
         updateNodeProperties: updateNodeProperties,
@@ -35832,7 +37448,8 @@ RED.editor = (function() {
                 filteredEditPanes[type] = filter
             }
             editPanes[type] = definition;
-        }
+        },
+        prepareConfigNodeSelect: prepareConfigNodeSelect,
     }
 })();
 ;;(function() {
@@ -37486,8 +39103,9 @@ RED.editor = (function() {
 ;RED.editor.envVarList = (function() {
 
     var currentLocale = 'en-US';
-    var DEFAULT_ENV_TYPE_LIST = ['str','num','bool','json','bin','env'];
-    var DEFAULT_ENV_TYPE_LIST_INC_CRED = ['str','num','bool','json','bin','env','cred','jsonata'];
+    const DEFAULT_ENV_TYPE_LIST = ['str','num','bool','json','bin','env'];
+    const DEFAULT_ENV_TYPE_LIST_INC_CONFTYPES = ['str','num','bool','json','bin','env','conf-types'];
+    const DEFAULT_ENV_TYPE_LIST_INC_CRED = ['str','num','bool','json','bin','env','cred','jsonata'];
 
     /**
      * Create env var edit interface
@@ -37495,8 +39113,8 @@ RED.editor = (function() {
      * @param node - subflow node
      */
     function buildPropertiesList(envContainer, node) {
-
-        var isTemplateNode = (node.type === "subflow");
+        if(RED.editor.envVarList.debug) { console.log('envVarList: buildPropertiesList', envContainer, node) }
+        const isTemplateNode = (node.type === "subflow");
 
         envContainer
             .css({
@@ -37568,7 +39186,14 @@ RED.editor = (function() {
                         // if `opt.ui` does not exist, then apply defaults. If these
                         // defaults do not change then they will get stripped off
                         // before saving.
-                        if (opt.type === 'cred') {
+                        if (opt.type === 'conf-types') {
+                            opt.ui = opt.ui || {
+                                icon: "fa fa-cog",
+                                type: "conf-types",
+                                opts: {opts:[]}
+                            }
+                            opt.ui.type = "conf-types";
+                        } else if (opt.type === 'cred') {
                             opt.ui = opt.ui || {
                                 icon: "",
                                 type: "cred"
@@ -37604,7 +39229,7 @@ RED.editor = (function() {
                             }
                         });
 
-                        buildEnvEditRow(uiRow, opt.ui, nameField, valueField);
+                        buildEnvEditRow(uiRow, opt, nameField, valueField);
                         nameField.trigger('change');
                     }
                 },
@@ -37666,21 +39291,23 @@ RED.editor = (function() {
      * @param nameField - name field of env var
      * @param valueField - value field of env var
      */
-     function buildEnvEditRow(container, ui, nameField, valueField) {
+     function buildEnvEditRow(container, opt, nameField, valueField) {
+        const ui = opt.ui
+        if(RED.editor.envVarList.debug) { console.log('envVarList: buildEnvEditRow', container, ui, nameField, valueField) }
          container.addClass("red-ui-editor-subflow-env-ui-row")
          var topRow = $('<div></div>').appendTo(container);
          $('<div></div>').appendTo(topRow);
          $('<div>').text(RED._("editor.icon")).appendTo(topRow);
          $('<div>').text(RED._("editor.label")).appendTo(topRow);
-         $('<div>').text(RED._("editor.inputType")).appendTo(topRow);
+         $('<div class="red-env-ui-input-type-col">').text(RED._("editor.inputType")).appendTo(topRow);
 
          var row = $('<div></div>').appendTo(container);
          $('<div><i class="red-ui-editableList-item-handle fa fa-bars"></i></div>').appendTo(row);
          var typeOptions = {
-             'input': {types:DEFAULT_ENV_TYPE_LIST},
-             'select': {opts:[]},
-             'spinner': {},
-             'cred': {}
+            'input': {types:DEFAULT_ENV_TYPE_LIST_INC_CONFTYPES},
+            'select': {opts:[]},
+            'spinner': {},
+            'cred': {}
          };
          if (ui.opts) {
              typeOptions[ui.type] = ui.opts;
@@ -37745,15 +39372,16 @@ RED.editor = (function() {
             labelInput.attr("placeholder",$(this).val())
         });
 
-        var inputCell = $('<div></div>').appendTo(row);
-        var inputCellInput = $('<input type="text">').css("width","100%").appendTo(inputCell);
+        var inputCell = $('<div class="red-env-ui-input-type-col"></div>').appendTo(row);
+        var uiInputTypeInput = $('<input type="text">').css("width","100%").appendTo(inputCell);
         if (ui.type === "input") {
-            inputCellInput.val(ui.opts.types.join(","));
+            uiInputTypeInput.val(ui.opts.types.join(","));
         }
         var checkbox;
         var selectBox;
 
-        inputCellInput.typedInput({
+        // the options presented in the UI section for an "input" type selection
+        uiInputTypeInput.typedInput({
             types: [
                 {
                     value:"input",
@@ -37914,7 +39542,7 @@ RED.editor = (function() {
                                         }
                                     });
                                     ui.opts.opts = vals;
-                                    inputCellInput.typedInput('value',Date.now())
+                                    uiInputTypeInput.typedInput('value',Date.now())
                                 }
                             }
                         }
@@ -37981,12 +39609,13 @@ RED.editor = (function() {
                                     } else {
                                         delete ui.opts.max;
                                     }
-                                    inputCellInput.typedInput('value',Date.now())
+                                    uiInputTypeInput.typedInput('value',Date.now())
                                 }
                             }
                         }
                     }
                 },
+                'conf-types',
                 {
                     value:"none",
                     label:RED._("editor.inputs.none"), icon:"fa fa-times",hasValue:false
@@ -38004,14 +39633,20 @@ RED.editor = (function() {
                 // In the case of 'input' type, the typedInput uses the multiple-option
                 // mode. Its value needs to be set to a comma-separately list of the
                 // selected options.
-                inputCellInput.typedInput('value',ui.opts.types.join(","))
+                uiInputTypeInput.typedInput('value',ui.opts.types.join(","))
+            } else if (ui.type === 'conf-types') {
+                // In the case of 'conf-types' type, the typedInput will be populated
+                // with a list of all config nodes types installed.
+                // Restore the value to the last selected type
+                uiInputTypeInput.typedInput('value', opt.type)
             } else {
                 // No other type cares about `value`, but doing this will
                 // force a refresh of the label now that `ui.opts` has
                 // been updated.
-                inputCellInput.typedInput('value',Date.now())
+                uiInputTypeInput.typedInput('value',Date.now())
             }
 
+            if(RED.editor.envVarList.debug) { console.log('envVarList: inputCellInput on:typedinputtypechange. ui.type = ' + ui.type) }
             switch (ui.type) {
                 case 'input':
                     valueField.typedInput('types',ui.opts.types);
@@ -38029,7 +39664,7 @@ RED.editor = (function() {
                     valueField.typedInput('types',['cred']);
                     break;
                 default:
-                    valueField.typedInput('types',DEFAULT_ENV_TYPE_LIST)
+                    valueField.typedInput('types', DEFAULT_ENV_TYPE_LIST);
             }
             if (ui.type === 'checkbox') {
                 valueField.typedInput('type','bool');
@@ -38041,8 +39676,46 @@ RED.editor = (function() {
             }
 
         }).on("change", function(evt,type) {
-            if (ui.type === 'input') {
-                var types = inputCellInput.typedInput('value');
+            const selectedType = $(this).typedInput('type') // the UI typedInput type
+            if(RED.editor.envVarList.debug) { console.log('envVarList: inputCellInput on:change. selectedType = ' + selectedType) }
+            if (selectedType === 'conf-types') {
+                const selectedConfigType = $(this).typedInput('value') || opt.type
+                let activeWorkspace = RED.nodes.workspace(RED.workspaces.active());
+                if (!activeWorkspace) {
+                    activeWorkspace = RED.nodes.subflow(RED.workspaces.active());
+                }
+
+                // get a list of all config nodes matching the selectedValue
+                const configNodes = [];
+                RED.nodes.eachConfig(function(config) {
+                    if (config.type == selectedConfigType && (!config.z || config.z === activeWorkspace.id)) {
+                        const modulePath = config._def?.set?.id || ''
+                        let label = RED.utils.getNodeLabel(config, config.id) || config.id;
+                        label += config.d ? ' ['+RED._('workspace.disabled')+']' : '';
+                        const _config = {
+                            _type: selectedConfigType,
+                            value: config.id,
+                            label: label,
+                            title: modulePath ? modulePath + ' - ' + label : label,
+                            enabled: config.d !== true,
+                            disabled: config.d === true,
+                        }
+                        configNodes.push(_config);
+                    }
+                });
+                const tiTypes = {
+                    value: selectedConfigType,
+                    label: "config",
+                    icon: "fa fa-cog",
+                    options: configNodes,
+                }
+                valueField.typedInput('types', [tiTypes]);
+                valueField.typedInput('type', selectedConfigType);
+                valueField.typedInput('value', opt.value);
+
+
+            } else if (ui.type === 'input') {
+                var types = uiInputTypeInput.typedInput('value');
                 ui.opts.types = (types === "") ? ["str"] : types.split(",");
                 valueField.typedInput('types',ui.opts.types);
             }
@@ -38054,7 +39727,7 @@ RED.editor = (function() {
         })
         // Set the input to the right type. This will trigger the 'typedinputtypechange'
         // event handler (just above ^^) to update the value if needed
-        inputCellInput.typedInput('type',ui.type)
+        uiInputTypeInput.typedInput('type',ui.type)
     }
 
     function setLocale(l, list) {
@@ -39661,9 +41334,22 @@ RED.editor = (function() {
             
             if (!initializing) {
                 initializing = true
-                $.getScript(
-                    'vendor/mermaid/mermaid.min.js',
-                    function (data, stat, jqxhr) {
+                // Find the cache-buster:
+                let cacheBuster
+                $('script').each(function (i, el) { 
+                    if (!cacheBuster) {
+                        const src = el.getAttribute('src')
+                        const m = /\?v=(.+)$/.exec(src)
+                        if (m) {
+                            cacheBuster = m[1]
+                        }
+                    }
+                })
+                $.ajax({
+                    url: `vendor/mermaid/mermaid.min.js?v=${cacheBuster}`,
+                    dataType: "script",
+                    cache: true,
+                    success: function (data, stat, jqxhr) {
                         mermaid.initialize({
                             startOnLoad: false,
                             theme: RED.settings.get('mermaid', {}).theme
@@ -39674,7 +41360,7 @@ RED.editor = (function() {
                             render(pending)
                         }
                     }
-                )
+                });
             }
         } else {
             const nodes = document.querySelectorAll(selector)
@@ -40161,7 +41847,13 @@ RED.editor.codeEditor.monaco = (function() {
         //Handles orphaned models
         //ensure loaded models that are not explicitly destroyed by a call to .destroy() are disposed
         RED.events.on("editor:close",function() {
-            let models = window.monaco ? monaco.editor.getModels() : null;
+            if (!window.monaco) { return; }
+            const editors = window.monaco.editor.getEditors()
+            const orphanEditors = editors.filter(editor => editor && !document.body.contains(editor.getDomNode()))
+            orphanEditors.forEach(editor => {
+                editor.dispose();
+            });
+            let models = monaco.editor.getModels()
             if(models && models.length) {
                 console.warn("Cleaning up monaco models left behind. Any node that calls createEditor() should call .destroy().")
                 for (let index = 0; index < models.length; index++) {
@@ -40581,7 +42273,7 @@ RED.editor.codeEditor.monaco = (function() {
                     createMonacoCompletionItem("set (flow context)", 'flow.set("${1:name}", ${1:value});','Set a value in flow context',range),
                     createMonacoCompletionItem("get (global context)", 'global.get("${1:name}");','Get a value from global context',range),
                     createMonacoCompletionItem("set (global context)", 'global.set("${1:name}", ${1:value});','Set a value in global context',range),
-                    createMonacoCompletionItem("get (env)", 'env.get("${1|NR_NODE_ID,NR_NODE_NAME,NR_NODE_PATH,NR_GROUP_ID,NR_GROUP_NAME,NR_FLOW_ID,NR_FLOW_NAME|}");','Get env variable value',range),
+                    createMonacoCompletionItem("get (env)", 'env.get("${1|NR_NODE_ID,NR_NODE_NAME,NR_NODE_PATH,NR_GROUP_ID,NR_GROUP_NAME,NR_FLOW_ID,NR_FLOW_NAME,NR_SUBFLOW_NAME,NR_SUBFLOW_ID,NR_SUBFLOW_PATH|}");','Get env variable value',range),
                     createMonacoCompletionItem("cloneMessage (RED.util)", 'RED.util.cloneMessage(${1:msg});',
                         ["```typescript",
                         "RED.util.cloneMessage<T extends registry.NodeMessage>(msg: T): T",
@@ -41120,6 +42812,7 @@ RED.editor.codeEditor.monaco = (function() {
 
             $(el).remove();
             $(toolbarRow).remove();
+            ed.dispose();
         }
 
         ed.resize = function resize() {
@@ -41836,6 +43529,7 @@ RED.eventLog = (function() {
                 setTimeout(function() {
                     oldTray.tray.detach();
                     showTray(options);
+                    RED.events.emit('editor:change')
                 },250)
             } else {
                 if (stack.length > 0) {
@@ -41905,6 +43599,7 @@ RED.eventLog = (function() {
                         RED.view.focus();
                     } else {
                         stack[stack.length-1].tray.css("z-index", "auto");
+                        RED.events.emit('editor:change')
                     }
                 },250)
             }
@@ -41939,6 +43634,7 @@ RED.clipboard = (function() {
     var currentPopoverError;
     var activeTab;
     var libraryBrowser;
+    var clipboardTabs;
 
     var activeLibraries = {};
 
@@ -42128,6 +43824,13 @@ RED.clipboard = (function() {
                 open: function( event, ui ) {
                     RED.keyboard.disable();
                 },
+                beforeClose: function(e) {
+                    if (clipboardTabs && activeTab === "red-ui-clipboard-dialog-export-tab-clipboard") {
+                        const jsonTabIndex = clipboardTabs.getTabIndex('red-ui-clipboard-dialog-export-tab-clipboard-json')
+                        const activeTabIndex = clipboardTabs.activeIndex()
+                        RED.settings.set("editor.dialog.export.json-view", activeTabIndex === jsonTabIndex )
+                    }
+                },
                 close: function(e) {
                     RED.keyboard.enable();
                     if (popover) {
@@ -42141,12 +43844,23 @@ RED.clipboard = (function() {
 
         exportNodesDialog =
             '<div class="form-row">'+
-                '<label style="width:auto;margin-right: 10px;" data-i18n="common.label.export"></label>'+
-                '<span id="red-ui-clipboard-dialog-export-rng-group" class="button-group">'+
-                    '<a id="red-ui-clipboard-dialog-export-rng-selected" class="red-ui-button toggle" href="#" data-i18n="clipboard.export.selected"></a>'+
-                    '<a id="red-ui-clipboard-dialog-export-rng-flow" class="red-ui-button toggle" href="#" data-i18n="clipboard.export.current"></a>'+
-                    '<a id="red-ui-clipboard-dialog-export-rng-full" class="red-ui-button toggle" href="#" data-i18n="clipboard.export.all"></a>'+
-                '</span>'+
+                '<div style="display: flex; justify-content: space-between;">'+
+                    '<div class="form-row">'+
+                        '<label style="width:auto;margin-right: 10px;" data-i18n="common.label.export"></label>'+
+                        '<span id="red-ui-clipboard-dialog-export-rng-group" class="button-group">'+
+                            '<a id="red-ui-clipboard-dialog-export-rng-selected" class="red-ui-button toggle" href="#" data-i18n="clipboard.export.selected"></a>'+
+                            '<a id="red-ui-clipboard-dialog-export-rng-flow" class="red-ui-button toggle" href="#" data-i18n="clipboard.export.current"></a>'+
+                            '<a id="red-ui-clipboard-dialog-export-rng-full" class="red-ui-button toggle" href="#" data-i18n="clipboard.export.all"></a>'+
+                        '</span>'+
+                    '</div>'+
+                    '<div class="form-row">'+
+                        '<label style="width:auto;margin-right: 10px;" data-i18n="common.label.format"></label>'+
+                        '<span id="red-ui-clipboard-dialog-export-fmt-group" class="button-group">'+
+                            '<a id="red-ui-clipboard-dialog-export-fmt-mini" class="red-ui-button red-ui-button toggle" href="#" data-i18n="clipboard.export.compact"></a>'+
+                            '<a id="red-ui-clipboard-dialog-export-fmt-full" class="red-ui-button red-ui-button toggle" href="#" data-i18n="clipboard.export.formatted"></a>'+
+                        '</span>'+
+                    '</div>'+
+                '</div>'+
             '</div>'+
             '<div class="red-ui-clipboard-dialog-box">'+
                 '<div class="red-ui-clipboard-dialog-tabs">'+
@@ -42161,14 +43875,8 @@ RED.clipboard = (function() {
                             '<div id="red-ui-clipboard-dialog-export-tab-clipboard-preview-list"></div>'+
                         '</div>'+
                         '<div class="red-ui-clipboard-dialog-export-tab-clipboard-tab" id="red-ui-clipboard-dialog-export-tab-clipboard-json">'+
-                            '<div class="form-row" style="height:calc(100% - 40px)">'+
+                            '<div class="form-row" style="height:calc(100% - 10px)">'+
                                 '<textarea readonly id="red-ui-clipboard-dialog-export-text"></textarea>'+
-                            '</div>'+
-                            '<div class="form-row" style="text-align: right;">'+
-                                '<span id="red-ui-clipboard-dialog-export-fmt-group" class="button-group">'+
-                                    '<a id="red-ui-clipboard-dialog-export-fmt-mini" class="red-ui-button red-ui-button-small toggle" href="#" data-i18n="clipboard.export.compact"></a>'+
-                                    '<a id="red-ui-clipboard-dialog-export-fmt-full" class="red-ui-button red-ui-button-small toggle" href="#" data-i18n="clipboard.export.formatted"></a>'+
-                                '</span>'+
                             '</div>'+
                         '</div>'+
                     '</div>'+
@@ -42482,7 +44190,7 @@ RED.clipboard = (function() {
 
         dialogContainer.empty();
         dialogContainer.append($(exportNodesDialog));
-
+        clipboardTabs = null
         var tabs = RED.tabs.create({
             id: "red-ui-clipboard-dialog-export-tabs",
             vertical: true,
@@ -42543,7 +44251,7 @@ RED.clipboard = (function() {
         $("#red-ui-clipboard-dialog-tab-library-name").on('paste',function() { setTimeout(validateExportFilename,10)});
         $("#red-ui-clipboard-dialog-export").button("enable");
 
-        var clipboardTabs = RED.tabs.create({
+        clipboardTabs = RED.tabs.create({
             id: "red-ui-clipboard-dialog-export-tab-clipboard-tabs",
             onchange: function(tab) {
                 $(".red-ui-clipboard-dialog-export-tab-clipboard-tab").hide();
@@ -42560,6 +44268,9 @@ RED.clipboard = (function() {
             id: "red-ui-clipboard-dialog-export-tab-clipboard-json",
             label: RED._("editor.types.json")
         });
+        if (RED.settings.get("editor.dialog.export.json-view") === true) {
+            clipboardTabs.activateTab("red-ui-clipboard-dialog-export-tab-clipboard-json");
+        }
 
         var previewList = $("#red-ui-clipboard-dialog-export-tab-clipboard-preview-list").css({position:"absolute",top:0,right:0,bottom:0,left:0}).treeList({
             data: []
@@ -44358,12 +46069,12 @@ RED.notifications = (function() {
                     if (newType) {
                         n.className = "red-ui-notification red-ui-notification-"+newType;
                     }
-
+                    newTimeout = newOptions.hasOwnProperty('timeout')?newOptions.timeout:timeout
                     if (!fixed || newOptions.fixed === false) {
-                        newTimeout = (newOptions.hasOwnProperty('timeout')?newOptions.timeout:timeout)||5000;
+                        newTimeout = newTimeout || 5000
                     }
                     if (newOptions.buttons) {
-                        var buttonSet = $('<div style="margin-top: 20px;" class="ui-dialog-buttonset"></div>').appendTo(nn)
+                        var buttonSet = $('<div class="ui-dialog-buttonset"></div>').appendTo(nn)
                         newOptions.buttons.forEach(function(buttonDef) {
                             var b = $('<button>').text(buttonDef.text).on("click", buttonDef.click).appendTo(buttonSet);
                             if (buttonDef.id) {
@@ -44409,6 +46120,15 @@ RED.notifications = (function() {
                 };
             })());
             n.timeoutid = window.setTimeout(n.close,timeout||5000);
+        } else if (timeout) {
+            $(n).on("click.red-ui-notification-close", (function() {
+                var nn = n;
+                return function() {
+                    nn.hideNotification();
+                    window.clearTimeout(nn.timeoutid);
+                };
+            })());
+            n.timeoutid = window.setTimeout(n.hideNotification,timeout||5000);
         }
         currentNotifications.push(n);
         if (options.id) {
@@ -46987,17 +48707,19 @@ RED.subflow = (function() {
 
 
     /**
-     * Create interface for controlling env var UI definition
+     * Build the edit dialog for a subflow template (creating/modifying a subflow template)
+     * @param {Object} uiContainer - the jQuery container for the environment variable list
+     * @param {Object} node - the subflow template node
      */
-    function buildEnvControl(envList,node) {
+    function buildEnvControl(uiContainer,node) {
         var tabs = RED.tabs.create({
             id: "subflow-env-tabs",
             onchange: function(tab) {
                 if (tab.id === "subflow-env-tab-preview") {
                     var inputContainer = $("#subflow-input-ui");
-                    var list = envList.editableList("items");
+                    var list = uiContainer.editableList("items");
                     var exportedEnv = exportEnvList(list, true);
-                    buildEnvUI(inputContainer, exportedEnv,node);
+                    buildEnvUI(inputContainer, exportedEnv, node);
                 }
                 $("#subflow-env-tabs-content").children().hide();
                 $("#" + tab.id).show();
@@ -47035,12 +48757,33 @@ RED.subflow = (function() {
         RED.editor.envVarList.setLocale(locale);
     }
 
-
-    function buildEnvUIRow(row, tenv, ui, node) {
+    /**
+     * Build a UI row for a subflow instance environment variable
+     * Also used to build the UI row for subflow template preview
+     * @param {JQuery} row - A form row element
+     * @param {Object} tenv - A template environment variable
+     * @param {String} tenv.name - The name of the environment variable
+     * @param {String} tenv.type - The type of the environment variable
+     * @param {String} tenv.value - The value set for this environment variable
+     * @param {Object} tenv.parent - The parent environment variable
+     * @param {String} tenv.parent.value - The value set for the parent environment variable
+     * @param {String} tenv.parent.type - The type of the parent environment variable
+     * @param {Object} tenv.ui - The UI configuration for the environment variable
+     * @param {String} tenv.ui.icon - The icon for the environment variable
+     * @param {Object} tenv.ui.label - The label for the environment variable
+     * @param {String} tenv.ui.type - The type of the UI control for the environment variable
+     * @param {Object} node - The subflow instance node
+     */
+    function buildEnvUIRow(row, tenv, node) {
+        if(RED.subflow.debug) { console.log("buildEnvUIRow", tenv) }
+        const ui = tenv.ui || {}
         ui.label = ui.label||{};
         if ((tenv.type === "cred" || (tenv.parent && tenv.parent.type === "cred")) && !ui.type) {
             ui.type = "cred";
             ui.opts = {};
+        } else if (tenv.type === "conf-types") {
+            ui.type = "conf-types"
+            ui.opts = { types: ['conf-types'] }
         } else if (!ui.type) {
             ui.type = "input";
             ui.opts = { types: RED.editor.envVarList.DEFAULT_ENV_TYPE_LIST }
@@ -47084,9 +48827,10 @@ RED.subflow = (function() {
         if (tenv.hasOwnProperty('type')) {
             val.type = tenv.type;
         }
+        const elId = getSubflowEnvPropertyName(tenv.name)
         switch(ui.type) {
             case "input":
-                input = $('<input type="text">').css('width','70%').appendTo(row);
+                input = $('<input type="text">').css('width','70%').attr('id', elId).appendTo(row);
                 if (ui.opts.types && ui.opts.types.length > 0) {
                     var inputType = val.type;
                     if (ui.opts.types.indexOf(inputType) === -1) {
@@ -47113,7 +48857,7 @@ RED.subflow = (function() {
                 }
                 break;
             case "select":
-                input = $('<select>').css('width','70%').appendTo(row);
+                input = $('<select>').css('width','70%').attr('id', elId).appendTo(row);
                 if (ui.opts.opts) {
                     ui.opts.opts.forEach(function(o) {
                         $('<option>').val(o.v).text(RED.editor.envVarList.lookupLabel(o.l, o.l['en-US']||o.v, locale)).appendTo(input);
@@ -47124,7 +48868,7 @@ RED.subflow = (function() {
             case "checkbox":
                 label.css("cursor","default");
                 var cblabel = $('<label>').css('width','70%').appendTo(row);
-                input = $('<input type="checkbox">').css({
+                input = $('<input type="checkbox">').attr('id', elId).css({
                     marginTop: 0,
                     width: 'auto',
                     height: '34px'
@@ -47142,7 +48886,7 @@ RED.subflow = (function() {
                 input.prop("checked",boolVal);
                 break;
             case "spinner":
-                input = $('<input>').css('width','70%').appendTo(row);
+                input = $('<input>').css('width','70%').attr('id', elId).appendTo(row);
                 var spinnerOpts = {};
                 if (ui.opts.hasOwnProperty('min')) {
                     spinnerOpts.min = ui.opts.min;
@@ -47154,7 +48898,7 @@ RED.subflow = (function() {
                 input.val(val.value);
                 break;
             case "cred":
-                input = $('<input type="password">').css('width','70%').appendTo(row);
+                input = $('<input type="password">').css('width','70%').attr('id', elId).appendTo(row);
                 if (node.credentials) {
                     if (node.credentials[tenv.name]) {
                         input.val(node.credentials[tenv.name]);
@@ -47171,18 +48915,25 @@ RED.subflow = (function() {
                     default: 'cred'
                 })
                 break;
-        }
-        if (input) {
-            input.attr('id',getSubflowEnvPropertyName(tenv.name))
+            case "conf-types":
+                // let clsId = 'config-node-input-' + val.type + '-' + val.value + '-' + Math.floor(Math.random() * 100000);
+                // clsId = clsId.replace(/\W/g, '-');
+                // input = $('<input>').css('width','70%').addClass(clsId).attr('id', elId).appendTo(row);
+                input = $('<input>').css('width','70%').attr('id', elId).appendTo(row);
+                const _type = tenv.parent?.type || tenv.type;
+                RED.editor.prepareConfigNodeSelect(node, tenv.name, _type, 'node-input-subflow-env', null, tenv);
+                break;
         }
     }
 
     /**
-     * Create environment variable input UI
+     * Build the edit form for a subflow instance
+     * Also used to build the preview form in the subflow template edit dialog
      * @param uiContainer - container for UI
      * @param envList - env var definitions of template
      */
     function buildEnvUI(uiContainer, envList, node) {
+        if(RED.subflow.debug) { console.log("buildEnvUI",envList) }
         uiContainer.empty();
         for (var i = 0; i < envList.length; i++) {
             var tenv = envList[i];
@@ -47190,7 +48941,7 @@ RED.subflow = (function() {
                 continue;
             }
             var row = $("<div/>", { class: "form-row" }).appendTo(uiContainer);
-            buildEnvUIRow(row,tenv, tenv.ui || {}, node);
+            buildEnvUIRow(row, tenv, node);
         }
     }
     // buildEnvUI
@@ -47263,6 +49014,9 @@ RED.subflow = (function() {
                                         delete ui.opts
                                     }
                                     break;
+                                case "conf-types":
+                                    delete ui.opts;
+                                    break;
                                 default:
                                     delete ui.opts;
                             }
@@ -47285,8 +49039,9 @@ RED.subflow = (function() {
         if (/^subflow:/.test(node.type)) {
             var subflowDef = RED.nodes.subflow(node.type.substring(8));
             if (subflowDef.env) {
-                subflowDef.env.forEach(function(env) {
+                subflowDef.env.forEach(function(env, i) {
                     var item = {
+                        index: i,
                         name:env.name,
                         parent: {
                             type: env.type,
@@ -47323,14 +49078,20 @@ RED.subflow = (function() {
                     var nodePropValue = nodeProp;
                     if (prop.ui && prop.ui.type === "cred") {
                         nodePropType = "cred";
+                    } else if (prop.ui && prop.ui.type === "conf-types") {
+                        nodePropType = prop.value.type
                     } else {
                         switch(typeof nodeProp) {
                             case "string": nodePropType = "str"; break;
                             case "number": nodePropType = "num"; break;
                             case "boolean": nodePropType = "bool"; nodePropValue = nodeProp?"true":"false"; break;
                             default:
-                            nodePropType = nodeProp.type;
-                            nodePropValue = nodeProp.value;
+                                if (nodeProp) {
+                                    nodePropType = nodeProp.type;
+                                    nodePropValue = nodeProp.value;
+                                } else {
+                                    nodePropType = 'str'
+                                }
                         }
                     }
                     var item = {
@@ -47351,6 +49112,7 @@ RED.subflow = (function() {
     }
 
     function exportSubflowInstanceEnv(node) {
+        if(RED.subflow.debug) { console.log("exportSubflowInstanceEnv",node) }
         var env = [];
         // First, get the values for the SubflowTemplate defined properties
         //  - these are the ones with custom UI elements
@@ -47382,7 +49144,7 @@ RED.subflow = (function() {
                         }
                         break;
                     case "cred":
-                        item.value = input.val();
+                        item.value = input.typedInput('value');
                         item.type = 'cred';
                         break;
                     case "spinner":
@@ -47397,6 +49159,9 @@ RED.subflow = (function() {
                         item.type = 'bool';
                         item.value = ""+input.prop("checked");
                         break;
+                    case "conf-types":
+                        item.value = input.val()
+                        item.type = "conf-type"
                 }
                 if (ui.type === "cred" || item.type !== data.parent.type || item.value !== data.parent.value) {
                     env.push(item);
@@ -47410,8 +49175,15 @@ RED.subflow = (function() {
         return 'node-input-subflow-env-'+name.replace(/[^a-z0-9-_]/ig,"_");
     }
 
-    // Called by subflow.oneditprepare for both instances and templates
+    
+    /**
+     * Build the subflow edit form
+     * Called by subflow.oneditprepare for both instances and templates
+     * @param {"subflow"|"subflow-template"} type - the type of subflow being edited
+     * @param {Object} node - the node being edited
+     */
     function buildEditForm(type,node) {
+        if(RED.subflow.debug) { console.log("buildEditForm",type,node) }
         if (type === "subflow-template") {
             // This is the tabbed UI that offers the env list - with UI options
             // plus the preview tab
@@ -51242,7 +53014,7 @@ RED.projects.settings = (function() {
         var notInstalledCount = 0;
 
         for (var m in modulesInUse) {
-            if (modulesInUse.hasOwnProperty(m)) {
+            if (modulesInUse.hasOwnProperty(m) && !activeProject.dependencies.hasOwnProperty(m)) {
                 depsList.editableList('addItem',{
                     id: modulesInUse[m].module,
                     version: modulesInUse[m].version,
@@ -51262,8 +53034,8 @@ RED.projects.settings = (function() {
 
         if (activeProject.dependencies) {
             for (var m in activeProject.dependencies) {
-                if (activeProject.dependencies.hasOwnProperty(m) && !modulesInUse.hasOwnProperty(m)) {
-                    var installed = !!RED.nodes.registry.getModule(m);
+                if (activeProject.dependencies.hasOwnProperty(m)) {
+                    var installed = !!RED.nodes.registry.getModule(m) && activeProject.dependencies[m] === modulesInUse[m].version;
                     depsList.editableList('addItem',{
                         id: m,
                         version: activeProject.dependencies[m], //RED.nodes.registry.getModule(module).version,
@@ -55074,9 +56846,14 @@ RED.touch.radialMenu = (function() {
     function listTour() {
         return [
             {
+                id: "4_0",
+                label: "4.0",
+                path: "./tours/welcome.js"
+            },
+            {
                 id: "3_1",
                 label: "3.1",
-                path: "./tours/welcome.js"
+                path: "./tours/3.1/welcome.js"
             },
             {
                 id: "3_0",
