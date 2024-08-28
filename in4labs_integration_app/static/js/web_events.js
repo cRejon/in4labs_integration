@@ -70,7 +70,8 @@ function countdownTimer(end_time) {
             $('#camera').prepend('<div class="session_blocked"><p>' + messages.SESSION_EXPIRED + '</p></div>');
             $('#node-red').prepend('<div class="session_blocked"><p>' + messages.SESSION_EXPIRED + '</p></div>');
             $('#cam').prop('src', '');
-            $('#node-red-iframe').prop('src', '');
+            $('#node-red-editor-iframe').prop('src', '');
+            $('#node-red-dashboard-iframe').prop('src', '');
             $('#node-red-download').show();
         return;
         }

@@ -8,3 +8,5 @@ COPY ./red.min.js /usr/src/node-red/node_modules/@node-red/editor-client/public/
 
 RUN rm /data/flows.json 
 COPY ./flows.json /data
+
+RUN npm install node-red-dashboard
