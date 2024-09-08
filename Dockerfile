@@ -12,6 +12,7 @@ RUN arduino-cli lib install "ArduinoBLE"
 RUN arduino-cli lib install "DHT sensor library"
 RUN arduino-cli lib install "LiquidCrystal"
 RUN arduino-cli lib install "PubSubClient"
+RUN arduino-cli lib install "ArduinoJson"
 
 # Python dependencies are installed here to ensure they will be cached.
 WORKDIR /app
