@@ -7,20 +7,6 @@ nodered_dir = os.path.join(basedir, os.pardir, 'node-red')
 nodered_settings_file = os.path.join(nodered_dir, 'settings.js')
 
 class Config(object):
-    
-    # Flask settings
-    ENV = 'development'
-    CACHE_TYPE = 'simple'
-    CACHE_DEFAULT_TIMEOUT = 600
-    SECRET_KEY = 'replace-me', # change in production
-    SESSION_TYPE= 'filesystem',
-    SESSION_FILE_DIR = mkdtemp(),
-    SESSION_COOKIE_NAME = 'app-sessionid' 
-    SESSION_COOKIE_HTTPONLY = True
-    SESSION_COOKIE_SECURE = False   # should be True in case of HTTPS usage (production)
-    SESSION_COOKIE_SAMESITE = None  # should be 'None' in case of HTTPS usage (production)
-    DEBUG_TB_INTERCEPT_REDIRECTS = False
-
     # Labs settings
     labs_config = {
         'duration': 15, # minutes
