@@ -37,16 +37,14 @@ def get_usb_driver(boards):
 
 def fill_examples(board):
     key = board[0]
-    role = board[1]['role']
 
     app_dir = os.path.abspath('/app')
     arduino_dir = os.path.join(app_dir, 'arduino')
     commons_path = os.path.join(arduino_dir, 'examples', 'Commons')
-    role_path = os.path.join(arduino_dir, 'examples', role)
     key_path = os.path.join(arduino_dir, 'examples', key)
 
     examples = []
-    for path in [commons_path, role_path, key_path]:
+    for path in [commons_path, key_path]:
         examples += [file for file in os.listdir(path) if file.endswith('.ino')]
     # Sort them alphabetically
     examples.sort()
