@@ -15,8 +15,7 @@ class Config(object):
             'html_name' : 'Integration System Laboratory',
             'description' : 'In4Labs laboratory for integration systems.',
             'host_port' : 8001,
-            'volumes': {'/dev/bus/usb': {'bind': '/dev/bus/usb', 'mode': 'rw'},
-                        'integration_lab_vol': {'bind': '/app/node-red/data', 'mode': 'ro'}},
+            'volumes': {'integration_lab_vol': {'bind': '/app/node-red/data', 'mode': 'ro'}},
             'cam_url': 'http://ULR_TO_WEBCAM/Mjpeg',
             'extra_containers': [{
                 'name': 'node-red',

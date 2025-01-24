@@ -46,6 +46,9 @@ lab = Config.labs_config['labs'][0]
 lab_name = lab['lab_name']
 lab_image_name = f'{lab_name.lower()}:latest'
 host_port = lab['host_port']
+default_volume = {'/dev/bus/usb': {'bind': '/dev/bus/usb', 'mode': 'rw'}}
+lab_volumes = default_volume.update(lab.get('volumes', {}))
+
 
 # Export DOCKER_HOST environment variable to run in rootless mode
 os.environ['DOCKER_HOST'] = 'unix:///run/user/1000/docker.sock'
@@ -165,7 +168,7 @@ container_lab = client.containers.run(
                 remove=True,
                 privileged=True,
                 ports={'8000/tcp': ('0.0.0.0', host_port)}, 
-                volumes=lab.get('volumes', {}),
+                volumes=lab_volumes,
                 environment=docker_env)
 containers.append(container_lab)
 
