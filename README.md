@@ -1,15 +1,13 @@
-In4Labs - Systems Integration remote lab
+In4Labs - Systems Integration remote lab [![CC BY-NC-SA 4.0][cc-by-nc-sa-shield]][cc-by-nc-sa]
 =====
 # Description
-Implementation of the Systems Integration remote lab inside a Docker container that will be run by [In4Labs base LTI tool](https://github.com/cRejon/in4labs).   
-Tested on Raspberry Pi OS Lite Bullseye (64-bit).  
-Docker version 25.0.5 
-Requires Python >=3.9 
+Implementation of the Systems Integration lab inside a Docker image that will be run by the tools [In4Labs base LTI tool](https://github.com/cRejon/in4labs) (if using a LMS such as Moodle) or [In4Labs base auth tool](https://github.com/cRejon/in4labs_auth) (if basic authentication is desired).  
+Tested on Raspberry Pi OS Lite Bullseye (64-bit). Requires Python >=3.9.
 
 # Installation
 ## Arduino USB connections
-Connect each Arduino board to the Raspberry Pi according to boards configuration.
-``` python
+This lab uses three [Arduino Nano ESP32](https://docs.arduino.cc/hardware/nano-esp32) boards to perform the experiments. Connect each board to the Raspberry Pi according to its **_'usb_port'_** variable inside the app _config.py_ file. These variables can be changed if more laboratories are installed on the same Raspberry Pi.
+```
 # Boards configuration
 boards = {
     'Board_1':{
@@ -108,67 +106,32 @@ sudo systemctl enable dnsmasq
 # Testing
 ## Setup Raspberry Pi
 ### Docker installation
-1. Run the following command to uninstall all conflicting packages:
-``` bash
-for pkg in docker.io docker-doc docker-compose podman-docker containerd runc; do sudo apt-get remove $pkg; done
+1. Install Docker through its bash script selecting the version to **25.0.5**:
 ```
-2. Add Docker's official GPG key:
-``` bash
 sudo apt update
-sudo apt-get install ca-certificates curl uidmap
-sudo install -m 0755 -d /etc/apt/keyrings
-sudo curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc
-sudo chmod a+r /etc/apt/keyrings/docker.asc
+curl -fsSL https://get.docker.com -o get-docker.sh
+sudo sh get-docker.sh --version 25.0.5
 ```
-3. Add the repository to Apt sources:
-``` bash
-echo \
-  "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian \
-  $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
-  sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
-sudo apt update
+2. Manage Docker as a non-root user:
+``` 
+sudo groupadd docker
+sudo usermod -aG docker $USER
+newgrp docker
 ```
-4. Select the version 25.0.5 for Bullseye and install Docker:
-``` bash
-VERSION_STRING=5:25.0.5-1~debian.11~bullseye
-sudo apt-get install docker-ce=$VERSION_STRING docker-ce-cli=$VERSION_STRING containerd.io
-```
-#### Set Rootless mode
-1. Disable the system-wide Docker daemon:
-``` bash
-sudo systemctl disable --now docker.service docker.socket
-sudo rm /var/run/docker.sock
-```
-2. Run dockerd-rootless-setuptool.sh install as a non-root user to set up the daemon:
-``` bash
-dockerd-rootless-setuptool.sh install
-```
-3. To run docker.service on system startup:
-``` bash
-sudo loginctl enable-linger pi
-```
-#### Change the permissions of the folder _/dev/bus/usb_ to be accessible by the current user (_pi_)
-1. Create a new _udev_ rule file:
-``` bash
-sudo nano /etc/udev/rules.d/99-usb.rules
-```
-2. Add the following content to the file:
-``` bash
-SUBSYSTEM=="usb", GROUP="pi", MODE="0775"
-```
-3. Reload and trigger the new _udev_ rules:
-``` bash
-sudo udevadm control --reload-rules
-sudo udevadm trigger
-```
-
 ### Python packages
-``` bash
-sudo apt install -y python3-docker python3-bcrypt
+```
+sudo apt install -y python3-docker
 ```
 ## Running
 Execute the **_test.py_** file inside _test folder_ and go in your browser to the given url.  
-The Lab Docker container is created via the Dockerfile <ins>only</ins> the first time this script is run. This will take some time, so please be patient.  
+The Docker container is created via the Dockerfile <ins>only</ins> the first time this script is run. This will take some time, so please be patient.  
 On the login page, enter ```admin@email.com``` as user.
+# License
+This work is licensed under a
+[Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International License][cc-by-nc-sa].
 
+[![CC BY-NC-SA 4.0][cc-by-nc-sa-image]][cc-by-nc-sa]
 
+[cc-by-nc-sa]: http://creativecommons.org/licenses/by-nc-sa/4.0/
+[cc-by-nc-sa-image]: https://licensebuttons.net/l/by-nc-sa/4.0/88x31.png
+[cc-by-nc-sa-shield]: https://img.shields.io/badge/License-CC%20BY--NC--SA%204.0-lightgrey.svg
