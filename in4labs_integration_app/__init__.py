@@ -113,13 +113,16 @@ def index():
 @app.route('/get_example', methods=['GET'])
 @login_required
 def get_example(): 
+    board = request.args.get('board')
     example = request.args.get('example')      
-    examples_path = os.path.join(arduino_dir, 'examples')
+    
+    examples_path = os.path.join(app.instance_path, 'examples')
+    board_path = os.path.join(examples_path, board)
+    commons_path = os.path.join(examples_path, 'Commons')
 
-    # Find example file in the corresponding folder
-    for folder in os.listdir(examples_path):
-        if example in os.listdir(os.path.join(examples_path, folder)):
-            example_file = os.path.join(examples_path, folder, example)
+    for path in [board_path, commons_path]:
+        if example in os.listdir(path):
+            example_file = os.path.join(path, example)
             break
 
     return send_file(example_file, mimetype='text')
