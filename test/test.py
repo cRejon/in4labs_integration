@@ -49,10 +49,6 @@ host_port = lab['host_port']
 default_volume = {'/dev/bus/usb': {'bind': '/dev/bus/usb', 'mode': 'rw'}}
 lab_volumes = default_volume.update(lab.get('volumes', {}))
 
-
-# Export DOCKER_HOST environment variable to run in rootless mode
-os.environ['DOCKER_HOST'] = 'unix:///run/user/1000/docker.sock'
-
 # Create docker lab image if not exists
 client = docker.from_env()
 try:
