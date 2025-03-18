@@ -86,10 +86,9 @@ def fill_examples(board):
 
     examples = []
     for path in [board_path, commons_path]:
-        try:
+        if os.path.isdir(path):
             examples += [file for file in os.listdir(path) if file.endswith('.ino')]
-        except FileNotFoundError:
-            pass
+
     # Sort them alphabetically
     examples.sort()
 
