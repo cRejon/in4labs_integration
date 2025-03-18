@@ -22,7 +22,7 @@ class StopContainersTask(threading.Thread):
          self.end_time = end_time
  
      def run(self):
-        remaining_secs = (end_time - datetime.now()).total_seconds()
+        remaining_secs = (end_time - datetime.now(timezone.utc)).total_seconds()
         time.sleep(remaining_secs)
         for container in self.containers:
             container.stop()
