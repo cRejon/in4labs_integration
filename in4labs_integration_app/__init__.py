@@ -1,20 +1,16 @@
 import os
 import subprocess
 import time
+from datetime import datetime, timedelta, timezone
 
 import pexpect
 import requests
 from flask import Flask, render_template, url_for, jsonify, redirect, send_file, flash, request
 from flask_login import LoginManager, UserMixin, login_required, current_user, login_user
 
-from .utils import get_serial_number, get_usb_driver, create_editor, create_navtab
+from .config import boards_config
+from .utils import cleanLab, upload_sketch, update_boards_config, create_editor, create_navtab
 
-
-# Flask environment variable needed for session management
-flask_config = {
-    # Use as secret key the user email + the end time of the session 
-    'SECRET_KEY': os.environ.get('USER_EMAIL') + os.environ.get('END_TIME'),
-}
 
 # Docker environment variables
 cam_url = os.environ.get('CAM_URL') 
@@ -22,47 +18,30 @@ user_email = os.environ.get('USER_EMAIL')
 end_time = os.environ.get('END_TIME') 
 node_red_url = os.environ.get('NODE_RED_URL')
 
-# Boards configuration
-boards = {
-    'Board_1':{
-        'name':'LCD',
-        'role':'Master',
-        #'model':'Arduino Uno WiFi Rev2',
-        #'fqbn':'arduino:megaavr:uno2018',
-        'model':'Arduino Nano ESP32',
-        'fqbn':'arduino:esp32:nano_nora',
-        'usb_port':'2',
-    },
-    'Board_2':{
-        'name':'Sensor',
-        'role':'Slave',
-        'model':'Arduino Nano ESP32',
-        'fqbn':'arduino:esp32:nano_nora',
-        'usb_port':'1',
-    },
-    'Board_3':{
-        'name':'Fan',
-        'role':'Slave',
-        'model':'Arduino Nano ESP32',
-        'fqbn':'arduino:esp32:nano_nora',
-        'usb_port':'3',
-    }
+# The user end time will be 10 seconds before the actual end time
+# to have some margin to clean the lab
+user_end_time = datetime.strptime(end_time, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=timezone.utc) - timedelta(seconds=10)
+
+boards = update_boards_config(boards_config)
+
+app = Flask(__name__, instance_path=os.path.join(os.getcwd(), 'arduino'))
+# Flask environment variable needed for session management
+flask_config = {
+    # Use as secret key the user email + the end time of the session 
+    'SECRET_KEY': user_email + end_time,
 }
-
-boards = get_serial_number(boards) # Get the serial number of the boards
-
-app = Flask(__name__)
 app.config.from_mapping(flask_config)
-app_dir = os.path.abspath('/app')
-arduino_dir = os.path.join(app_dir, 'arduino')
-nodered_dir = os.path.join(app_dir, 'node-red')
+
+# Start the thread to clean the lab
+clean_lab = cleanLab(boards, user_end_time, app.instance_path)
+clean_lab.start()
 
 # Create the subfolders for the compilations
 try:
     for board in boards.keys():
-        os.makedirs(os.path.join(arduino_dir, 'compilations', board))
+        os.makedirs(os.path.join(app.instance_path, 'compilations', board))
         for dir in ['build', 'cache', 'temp_sketch']:
-            os.makedirs(os.path.join(arduino_dir, 'compilations', board, dir))
+            os.makedirs(os.path.join(app.instance_path, 'compilations', board, dir))
 except OSError:
     pass
 
@@ -104,11 +83,12 @@ def login():
 def index():
     navtabs = []
     editors = []
-    for board in boards.items():
-        navtabs.append(create_navtab(board))
-        editors.append(create_editor(board))
+    for board_conf in boards.items():
+        navtabs.append(create_navtab(board_conf))
+        editors.append(create_editor(board_conf))
     return render_template('index.html', boards=boards, navtabs=navtabs, node_red_url=node_red_url,
-                                editors=editors, cam_url=cam_url, end_time=end_time)
+                                editors=editors, cam_url=cam_url, 
+                                end_time=user_end_time.strftime('%Y-%m-%dT%H:%M:%S.%fZ'))
 
 @app.route('/get_example', methods=['GET'])
 @login_required
@@ -130,19 +110,23 @@ def get_example():
 @app.route('/compile', methods=['POST'])
 @login_required
 def compile():
+    global boards
+
     board = request.form['board']
     code = request.form['text']
 
-    compilation_path = os.path.join(arduino_dir, 'compilations', board)
+    fqbn = boards[board]['fqbn']
+    
+    compilation_path = os.path.join(app.instance_path, 'compilations', board)
     sketch_path = os.path.join(compilation_path, 'temp_sketch')
 
     with open(os.path.join(sketch_path, 'temp_sketch.ino'), 'w') as f:
         f.write(code)
 
-    command = ['arduino-cli', 'compile', '--fqbn', boards[board]['fqbn'],
-    '--build-cache-path', os.path.join(compilation_path, 'cache'), 
-    '--build-path', os.path.join(compilation_path, 'build'), 
-    sketch_path]
+    command = ['arduino-cli', 'compile', '--fqbn', fqbn,
+        '--build-cache-path', os.path.join(compilation_path, 'cache'), 
+        '--build-path', os.path.join(compilation_path, 'build'), 
+        sketch_path]
 
     result = subprocess.run(command, capture_output=True, text=True) 
 
@@ -152,63 +136,23 @@ def compile():
 @app.route('/execute', methods=['POST'])
 @login_required
 def execute():
+    global boards
+
     board = request.form['board']
     target = request.form['target']
-
-    load_sketch(board, target)
-
-    resp = jsonify(board=board)
+    
+    for board_conf in boards.items():
+        if board_conf[0] == board:
+            result = upload_sketch(board_conf, target)
+            break 
+    
+    resp = jsonify(board=board, error=result.stderr)
     return resp
-
-def load_sketch(board, target):
-    if boards[board]['model'] == 'Arduino Nano ESP32':
-        if (target == 'user'): 
-            input_file = os.path.join(arduino_dir, 'compilations', board, 'build', 'temp_sketch.ino.bin')
-        else: # target == 'stop'
-            input_file = os.path.join(arduino_dir, 'compilations', 'precompiled','stop.ino.bin')
-
-        dfu_util = os.path.join('/', 'root', '.arduino15', 'packages', 'arduino',
-                                    'tools', 'dfu-util', '0.11.0-arduino5', 'dfu-util')
-        serial_number = boards[board]['serial_number']
-
-        command = [dfu_util, '--serial', serial_number, '-D', input_file, '-Q']
-
-    elif boards[board]['model'] == 'Arduino Uno WiFi Rev2':
-        # NOTE: Arduino-cli uses AVRdude to upload the code and it does not work properly if -Pusb flag is used with 
-        #       the usb interface of the board, so we use the last two digits of the serial number instead.
-        if (target == 'user'): 
-            input_file = os.path.join(arduino_dir, 'compilations', board, 'build', 'temp_sketch.ino.hex')
-        else: # target == 'stop'
-            input_file = os.path.join(arduino_dir, 'compilations', 'precompiled','stop.ino.hex')
-
-        serial_number = boards[board]['serial_number'][-2:]
-        avrdude_path = os.path.join('/', 'root', '.arduino15', 'packages', 'arduino',
-                                    'tools', 'avrdude', '6.3.0-arduino17', 'bin', 'avrdude')
-        avrdude_conf_path = os.path.join('/', 'root', '.arduino15', 'packages', 'arduino', 
-                                        'tools', 'avrdude', '6.3.0-arduino17', 'etc', 'avrdude.conf')
-        avrdude_partno = 'atmega4809'
-        avrdude_programer_id = 'xplainedmini_updi'
-        avrdude_usb_port = '-Pusb:'+ serial_number
-        avrdude_baudrate = '115200'
-        avrdude_sketch =  '-Uflash:w:'+ input_file +':i'
-        avrdude_fuse_2 = '-Ufuse2:w:0x01:m'
-        avrdude_fuse_5 = '-Ufuse5:w:0xC9:m'
-        avrdude_fuse_8 = '-Ufuse8:w:0x02:m'
-        avrdude_boot = os.path.join('/', 'root', '.arduino15', 'packages', 'arduino',
-                                    'hardware', 'megaavr', '1.8.8', 'bootloaders', 'atmega4809_uart_bl.hex:i')
-
-        command = [avrdude_path, '-C', avrdude_conf_path, '-V', '-p', avrdude_partno, '-c', avrdude_programer_id, 
-                avrdude_usb_port, '-b', avrdude_baudrate, '-e', '-D', avrdude_sketch, avrdude_fuse_2, 
-                avrdude_fuse_5, avrdude_fuse_8, avrdude_boot]
-
-    result = subprocess.run(command, capture_output=True, text=True) 
-    print(result) # Debug info
 
 @app.route('/monitor', methods=['GET'])
 @login_required
 def monitor():
     global boards
-    boards = get_usb_driver(boards) # Get the drivers of the boards
     
     board = request.args.get('board')
     baudrate = request.args.get('baudrate', default=9600, type=int)
@@ -251,14 +195,17 @@ def suggest():
 @app.route('/reset_lab', methods=['GET'])
 @login_required
 def reset():
+    global boards
+    
     # Uhubctl is used to power on/off the USB ports of the Raspberry Pi
     command = ['uhubctl', '-a', 'cycle', '-l', '1-1', '-d', '2']
     result = subprocess.run(command, capture_output=True, text=True)
+    
     # Load the stop code in all the boards
     time.sleep(1)
-    for board in boards:
-        print('Loading stop code in ' + board)
-        load_sketch(board, 'stop')
+    for board_conf in boards.items():
+        upload_sketch(board_conf, 'stop')
+    
     # Return the output of the command for debugging purposes
     resp = jsonify(result=result.stdout)
     return resp
@@ -266,6 +213,7 @@ def reset():
 @app.route('/get_flows', methods=['GET'])
 @login_required
 def get_flows(): 
+    nodered_dir = os.path.abspath('/app/node-red')
     nodered_data_dir = os.path.join(nodered_dir, 'data')
     flows_file = os.path.join(nodered_data_dir, 'flows.json')
     with open(flows_file, 'r') as f:
