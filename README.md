@@ -41,7 +41,7 @@ If you look at the USB hub from the front, the port numbering is as follows.
 ``` bash
 sudo raspi-config
 ``` 
-Go to _System Options_ -> _Wireless LAN_ and select your country.  
+Go to _Localisation Options_ -> _WLAN Country_ and select your country.  
 
 2. Install required packages
 ``` bash
