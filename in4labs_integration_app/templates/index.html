@@ -23,72 +23,20 @@
                     </div>
                 </div>
                 <div class="camera" id="camera">
-                    <iframe id="cam"
-                            src="{{ cam_url }}"
-                            allowfullscreen="allowfullscreen"
-                            mozallowfullscreen="mozallowfullscreen"
-                            webkitallowfullscreen="webkitallowfullscreen"
-                            width="560">
-                    </iframe>
-                </div>
-            </div>
-            <br>
-            <div class="container-fluid">
-                <div class="row justify-content-center">
-                    <div class="col-11">
-                        <div class="card" style="background: #00979C; color: white;">
-                            <div class="card-body">
-                                <div class="row">
-                                    <div class="col-3">
-                                        <button id="node-red-download" type="button" class="btn btn-primary" style="display: none;" onclick="donwloadFlows()"><span class="fa fa-download"></span> Save Deployed Flows</button>
-                                        <textarea id="node-red-flows" style="display: none;"></textarea>
-                                    </div>
-                                    <div class="col-6">
-                                        <h3 class="card-title"><u>Node-RED</u></h3>
-                                    </div>
-                                    <div class="col-3"></div>                        
-                                </div>
-                                <br>
-                                <div class="row">
-                                    <nav>
-                                        <div class="nav nav-tabs" id="nav-tab-nodered" role="tablist">
-                                            <button class="nav-link col-sm-6 active" id="nav-nodered-editor-tab" data-bs-toggle="tab" data-bs-target="#nav-nodered-editor" type="button" role="tab" aria-controls="nav-nodered-editor" aria-selected="true">Editor</button>
-                                            <button class="nav-link col-sm-6" id="nav-nodered-dashboard-tab" data-bs-toggle="tab" data-bs-target="#nav-nodered-dashboard" type="button" role="tab" aria-controls="nav-nodered-dashboard" aria-selected="true">Dashboard</button>
-                                        </div>
-                                    </nav>
-                                </div>
-                            </div>
-                            <div class="tab-content" id="nav-tabContent-nodered">
-                                <div class="tab-pane fade active show" id="nav-nodered-editor" role="tabpanel" aria-labelledby="nav-nodered-editor-tab">
-                                    <iframe id="node-red-editor-iframe"
-                                            src="{{ node_red_url }}" 
-                                            width="100%" 
-                                            height="600px">
-                                    </iframe>
-                                </div>
-                                <div class="tab-pane fade" id="nav-nodered-dashboard" role="tabpanel" aria-labelledby="nav-nodered-dashboard-tab">
-                                    <iframe id="node-red-dashboard-iframe"
-                                            src="{{ node_red_url }}/ui" 
-                                            width="100%" 
-                                            height="600px">
-                                    </iframe>
-                                </div>
-                            </div>
-                        </div>
+                    <div class="card-body">
+                        <h3 style="margin-top: 10px;"><u>Webcam</u></h3>
+                        <video
+                        id="cam"
+                        autoplay
+                        muted
+                        playsinline
+                        style="margin-top: 20px;"
+                        width="570">
+                        </video>
                     </div>
                 </div>
             </div>
             <br>
-            <div class="row justify-content-center">
-                <div class="col-10">
-                    <div class="card" style="background: #00979C; color: white;">
-                        <div class="card-body">
-                          <h3><u>Circuit diagram</u></h3>
-                        </div>
-                        <img src="{{ url_for('static', filename='img/circuit_diagram.jpg') }}" class="img img-fluid m-2" alt="Circuit diagram">
-                    </div>
-                </div>
-            </div>
         </div>
         <div class="timer">
             <p class="text-right">Remaining time</p>
@@ -109,6 +57,17 @@
             let end_time = new Date("{{ end_time }}").getTime();
             countdownTimer(end_time); 
         </script>
+        <script>
+            const cam = document.getElementById('cam');
+            if (cam && Hls.isSupported()) {
+                // 1) No-cache
+                const src = "{{ cam_url }}?t=" + Date.now();
+                // 2) startPosition = -1 start on live-edge
+                const hls = new Hls({ startPosition: -1 });
+                hls.loadSource(src);
+                hls.attachMedia(cam);
+                hls.on(Hls.Events.MANIFEST_PARSED, () => cam.play());
+            }
+        </script>
     </section>
 {% endblock %} 
-
