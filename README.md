@@ -41,7 +41,7 @@ If you look at the USB hub from the front, the port numbering is as follows.
 ``` bash
 sudo raspi-config
 ``` 
-Go to _System Options_ -> _Wireless LAN_ and select your country.  
+Go to _Localisation Options_ -> _WLAN Country_ and select your country.  
 
 2. Install required packages
 ``` bash
@@ -120,7 +120,7 @@ newgrp docker
 ```
 ### Python packages
 ```
-sudo apt install -y python3-docker
+sudo apt install -y python3-docker python3-bcrypt
 ```
 ## Running
 Execute the **_test.py_** file inside _test folder_ and go in your browser to the given url.  
