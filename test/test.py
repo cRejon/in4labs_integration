@@ -40,17 +40,52 @@ def create_docker_image(image_name, dockerfile_path):
         print(log.get('stream', '').strip())
     print(f'Docker image {image_name} created successfully.')
 
+def setup_node_red(client, volume_name, dir, url, email):
+    # Clean the volume for the new user
+    volume = client.volumes.get(volume_name)
+    volume.remove()
+    client.volumes.create(volume_name)
+    # Set the username and password for the node-red container
+    # Generate bcrypt hash from the user email
+    hashed_password = bcrypt.hashpw(email.encode(), bcrypt.gensalt()).decode()
+    # Copy the default settings file
+    settings_default_file = os.path.join(dir, 'settings_default.js')
+    with open(settings_default_file, 'r') as file:
+        js_content = file.read()
+    # Use regular expressions to find and replace the username, password, admin URL, and node URL
+    username_pattern = r'username:\s*"[^"]*"'
+    password_pattern = r'password:\s*"[^"]*"'
+    admin_url_pattern = r'httpAdminRoot:\s*"[^"]*"'
+    node_url_pattern = r'httpNodeRoot:\s*"[^"]*"'
+    new_username_line = f'username: "{email}"'
+    new_password_line = f'password: "{hashed_password}"'
+    new_admin_url_line = f'httpAdminRoot: "{url}"'
+    new_node_url_line = f'httpNodeRoot: "{url}"'
+    js_content = re.sub(username_pattern, new_username_line, js_content)
+    js_content = re.sub(password_pattern, new_password_line, js_content)
+    js_content = re.sub(admin_url_pattern, new_admin_url_line, js_content)
+    js_content = re.sub(node_url_pattern, new_node_url_line, js_content)
+    # Write the modified content in a settings.js file
+    settings_file = os.path.join(dir, 'settings.js')
+    with open(settings_file, 'w') as file:
+        file.write(js_content)
+
 # Import lab config from Config object
-lab_duration = Config.labs_config['duration']
+server_name = Config.labs_config['server_name']
+mounting = Config.labs_config['mountings'][0]
+lab_duration = mounting['duration'] # in minutes
+cam_url = mounting.get('cam_url', '')
+lab_port = mounting['host_port']
 lab = Config.labs_config['labs'][0]
 lab_name = lab['lab_name']
-lab_image_name = f'{lab_name.lower()}:latest'
-host_port = lab['host_port']
+
+nodered_dir = os.path.join(basedir, os.pardir, 'node-red')
 default_volume = {'/dev/bus/usb': {'bind': '/dev/bus/usb', 'mode': 'rw'}}
 lab_volumes = default_volume.update(lab.get('volumes', {}))
 
 # Create docker lab image if not exists
 client = docker.from_env()
+lab_image_name = f'{lab_name.lower()}:latest'
 try:
     client.images.get(lab_image_name)
     print(f'Docker image {lab_image_name} already exists.')
@@ -68,8 +103,7 @@ for container in extra_containers:
     except docker.errors.ImageNotFound:
         if container['name'] == 'node-red':
             # Create the node-red image
-            nodered_dockerfile_path = os.path.join(basedir, os.pardir, 'node-red')
-            create_docker_image(image_name, nodered_dockerfile_path)
+            create_docker_image(image_name, nodered_dir)
         else:
             print(f'Pulling Docker image {image_name}. Be patient, this will take a while...')
             client.images.pull(image_name)
@@ -87,7 +121,7 @@ for container in extra_containers:
 
     # Create volumes
     volumes = container.get('volumes', {})
-    for volume_name, volume in volumes.items():
+    for volume_name in volumes.keys():
         # Check if volume_name not starts with '/', so it is a volume and not a path
         if not volume_name.startswith('/'):
             try:
@@ -100,60 +134,34 @@ for container in extra_containers:
 
 print('All Docker images, networks and volumes are ready.')
 
-# Get the Raspberry pi IP address
-hostname = subprocess.check_output(['hostname', '-I']).decode("utf-8").split()[0]
-nodered_nat_port = lab['extra_containers'][0]['nat_port']
-
 # Docker environment variables
+user_email = 'admin@email.com'
 end_time = datetime.now(timezone.utc) + timedelta(minutes=lab_duration)
 docker_env = {
-    'USER_EMAIL': 'admin@email.com',
+    'SERVER_NAME': server_name,
+    'LAB_NAME': lab_name,
+    'USER_EMAIL': user_email,
     'USER_ID': 1,
     'END_TIME': end_time.strftime('%Y-%m-%dT%H:%M:%S.%fZ'),
-    'CAM_URL': lab.get('cam_url', ''),
-    'NODE_RED_URL': f'http://{hostname}:{nodered_nat_port}',
+    'CAM_URL': cam_url,
 }
 
 containers = []
 # Start the extra containers
 for extra_container in extra_containers:
-    
     if extra_container['name'] == 'node-red':
-        # Clean the volume for the new user
-        volume_name = 'integration_lab_vol'
-        volume = client.volumes.get(volume_name)
-        volume.remove()
-        client.volumes.create(volume_name)
-
-        # Set the username and password for the node-red container
-        nodered_dir = os.path.join(basedir, os.pardir, 'node-red')
-        username = "admin@email.com"
-        # Generate bcrypt hash from the username
-        hashed_password = bcrypt.hashpw(username.encode(), bcrypt.gensalt()).decode()
-        # Copy the default settings file
-        settings_default_file = os.path.join(nodered_dir, 'settings_default.js')
-        with open(settings_default_file, 'r') as file:
-            js_content = file.read()
-        # Use regular expressions to find and replace the username and password
-        username_pattern = r'username:\s*"[^"]*"'
-        password_pattern = r'password:\s*"[^"]*"'
-        new_username_line = f'username: "{username}"'
-        new_password_line = f'password: "{hashed_password}"'
-        js_content = re.sub(username_pattern, new_username_line, js_content)
-        js_content = re.sub(password_pattern, new_password_line, js_content)
-        # Write the modified content in a settings.js file
-        settings_file = os.path.join(nodered_dir, 'settings.js')
-        with open(settings_file, 'w') as file:
-            file.write(js_content)
+        nodered_url = f'/{server_name}/{lab_name}/nodered' # don't put the trailing slash
+        volume_name = list(extra_container['volumes'].keys())[0] # e.g. 'integration_lab_vol'
+        setup_node_red(client, volume_name, nodered_dir, nodered_url, user_email)
 
     container_extra = client.containers.run(
                     extra_container['image'], 
                     name=extra_container['name'],
                     detach=True, 
                     remove=True,
-                    network=extra_container['network'],
                     ports=extra_container['ports'],
                     volumes=extra_container.get('volumes', {}),
+                    network=extra_container.get('network', ''),
                     command=extra_container.get('command', ''))
     containers.append(container_extra)
 
@@ -163,7 +171,7 @@ container_lab = client.containers.run(
                 detach=True, 
                 remove=True,
                 privileged=True,
-                ports={'8000/tcp': ('0.0.0.0', host_port)}, 
+                ports={'8000/tcp': ('0.0.0.0', lab_port)}, 
                 volumes=lab_volumes,
                 environment=docker_env)
 containers.append(container_lab)
@@ -172,8 +180,10 @@ stop_container = StopContainersTask(containers, end_time)
 stop_container.start()
 
 
-lab_url = f'http://{hostname}:{host_port}'
-print(f'The container is running at {lab_url} during {lab_duration} minutes.')
+# Get the Raspberry pi IP address
+hostname = subprocess.check_output(['hostname', '-I']).decode("utf-8").split()[0]
+container_url = f'http://{hostname}:{lab_port}/{server_name}/{lab_name}/'
+print(f'The container is running at {container_url} during {lab_duration} minutes.')
 
 # Stop the containers when the program exits by pressing Ctrl+C
 def exit_handler():

@@ -1,4 +1,3 @@
-from tempfile import mkdtemp
 import os
 
 
@@ -9,18 +8,22 @@ nodered_settings_file = os.path.join(nodered_dir, 'settings.js')
 class Config(object):
     # Labs settings
     labs_config = {
-        'duration': 15, # minutes
+        'server_name': 'test_server',
+        'mountings': [{
+            'id': '1', 
+            'duration': 10, # minutes
+            'cam_url': 'https://ULR_TO_WEBCAM/stream.m3u8',
+            'host_port' : 8001,
+        },],
         'labs': [{
             'lab_name' : 'in4labs_integration',
             'html_name' : 'Integration System Laboratory',
             'description' : 'In4Labs laboratory for integration systems.',
-            'host_port' : 8001,
+            'mounting_id': '1',
             'volumes': {'integration_lab_vol': {'bind': '/app/node-red/data', 'mode': 'ro'}},
-            'cam_url': 'http://ULR_TO_WEBCAM/Mjpeg',
             'extra_containers': [{
                 'name': 'node-red',
                 'image': 'in4labs_nodered:latest',
-                'nat_port': 1880,
                 'ports': {'1880/tcp': ('0.0.0.0', 1880)},
                 'volumes': {'integration_lab_vol': {'bind': '/data', 'mode': 'rw'},
                             nodered_settings_file: {'bind': '/data/settings.js', 'mode': 'ro'}},
