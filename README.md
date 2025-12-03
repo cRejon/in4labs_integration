@@ -104,8 +104,11 @@ sudo systemctl enable dnsmasq
 ```
 
 # Testing
-## Setup Raspberry Pi
-### Docker installation
+## Stop DNSmasq
+``` bash
+sudo systemctl stop dnsmasq
+```
+## Docker installation
 1. Install Docker through its bash script selecting the version to **25.0.5**:
 ```
 sudo apt update
@@ -118,9 +121,13 @@ sudo groupadd docker
 sudo usermod -aG docker $USER
 newgrp docker
 ```
-### Python packages
+## Python packages
 ```
 sudo apt install -y python3-docker python3-bcrypt
+```
+## Start DNSmasq
+``` bash
+sudo systemctl start dnsmasq
 ```
 ## Running
 Execute the **_test.py_** file inside _test folder_ and go in your browser to the given url.  
