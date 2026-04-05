@@ -36,14 +36,6 @@ user = User(id=1, email=Config.user_email)
 def load_user(user_id):
     return user
 
-# Create the subfolders for the compilations
-try:
-    for board in boards.keys():
-        os.makedirs(os.path.join(app.instance_path, 'compilations', board))
-        for dir in ['build', 'cache', 'temp_sketch']:
-            os.makedirs(os.path.join(app.instance_path, 'compilations', board, dir))
-except OSError:
-    pass
 
 # Register blueprints - moved to the end to avoid circular imports
 def register_blueprints():
